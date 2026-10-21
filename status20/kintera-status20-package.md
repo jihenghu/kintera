@@ -1,0 +1,2070 @@
+# kintera status-20 package: jupiter.yaml sweeps at a40a73d3 (base) and 6ed29f1d (#93 head)
+
+**Summary (status-20 cells, max_iter 100; wide TP / wide UV / cold TP / cold UV; each family is 5000 random states plus the appended PR cell #5000):**
+
+1. Base a40a73d3, CPU: 126 / 3 / 208 / 41. GPU0: 127 / 1 / 211 / 36.
+2. The same without the appended PR cell #5000, which is status 20 in TP at base in both families: CPU 125 / 3 / 207 / 41; GPU0 126 / 1 / 210 / 36.
+3. Head 6ed29f1d, CPU: 126 / 3 / 215 / 47. GPU0: 127 / 1 / 215 / 43. At head, cold rises because some status-2 cells became status-20; only 1 CPU and 3 GPU base status-20 cells converge.
+4. max_iter 1000, base: CPU 124 / 3 / 179 / 41; GPU0 125 / 1 / 182 / 36. Head: CPU 124 / 3 / 186 / 47; GPU0 125 / 1 / 186 / 43. UV(auto) at max_iter 100 is bit-identical to UV(kkt).
+5. Cross-check: 126 wide TP on CPU at base matches. For cold TP the saved output gives **208**, not 207. The extra cell is the appended PR cell #5000. Without it the counts are 207 cold, but then wide is 125. The 207 matches only if #5000 is excluded, and then the wide count must be 125.
+
+## 1. What was found, and where the numbers come from
+
+- **Origin.** All counts and per-cell values are read from the saved sweep outputs of the earlier #93 review. No solver was run for this package, and no brute-force deviation was newly computed.
+- **Output files.** One file per (build, device) holds all ten modes: wide/cold × TP100, TP1000, UVkkt100, UVkkt1000, UVauto100.
+- **Base a40a73d3.** CPU build on CPU; CUDA build on GPU0.
+- **Head 6ed29f1d.** CPU build on CPU; CUDA build on GPU0. The review rebuilt at 6ed29f1d after the force-push.
+- **Not found:**
+  - There is **no base output on GPU1.**
+  - There is **no 6ed29f1d output on GPU1.** GPU1 was run only at 75d0e3a2, the comment-only predecessor of 6ed29f1d.
+- **Bit-identity, checked here with `torch.equal` on every tensor of every mode:**
+  - 6ed29f1d = 75d0e3a2 on CPU and on GPU0.
+  - GPU1 = GPU0 at 75d0e3a2.
+  - So the GPU0 numbers stand for GPU1 at head.
+- **max_iter 1000.** Saved for TP and UV(kkt) on every device. UV(auto) was run only at max_iter 100, and no UV(auto) max_iter 1000 output exists.
+- **Inputs.** TP inputs (T, P, x) are generated on the host and are bit-identical on CPU and GPU. The UV inputs (rho, U, c) are computed on the device from those, so CPU and GPU differ at round-off: max |Δrho| 7e-15 kg/m³, max |ΔU| 2.2e-8 J/m³, max |Δc| 1.8e-12 mol/m³. The per-cell CSV gives each device's own rho and U.
+- **Status decoding.** kintera writes `diag = iterations` on success, or `-(100*status + iterations)` on failure (`src/thermo/equilibrate_tp.h:387`, `src/thermo/equilibrate_uv.h:620` at a40a73d3). Status 20 is the max_iter stop, so `diag == -(2000 + max_iter)` and the iteration count is max_iter. Every base status-20 row below has iter = max_iter.
+- **Brute force.** Deviations were computed earlier only for the cells the review selected: stop-rule firing cells, or cells whose status changed base→head. They cover only max_iter 100 TP and UV(kkt), and only converged states (status 0). For the status-20 cells in that selection, the CSV gives the brute-force reference assemblage and T and marks the deviation as not computed. Every other row says `not computed`.
+- **Cross-check source.** The 126 / 208 come from these files, and the #93 review report gives the same `126` and `208`. I found no saved output that gives 207 cold TP on CPU at base. The only way to get 207 is to drop cell #5000.
+
+## 2. State generation (exact)
+
+Generation is done in `sweep.py` (below) on the host CPU in float64 with `torch.Generator`, then moved to the device. N = 5000 per family. Species order is that of tests/jupiter.yaml: `0 dry, 1 H2O, 2 NH3, 3 H2S, 4 H2O(l), 5 H2O(l,p), 6 NH3(s), 7 NH3(s,p), 8 NH4SH(s)`.
+
+| family | seed | T | P | H2O, H2S | NH3 gas | 5 condensates (4–8) |
+|---|---|---|---|---|---|---|
+| wide | 0 | U[100, 350] K | logU[1e4, 1e7] Pa | 0 w.p. 1/4, else logU[1e-5, 5e-2] | 0 w.p. 1/4, else logU[1e-5, 5e-2] | each 0 w.p. 1/2, else logU[1e-8, 1e-2] |
+| cold | 1 | U[100, 110] K | logU[1e4, 1e7] Pa | same | 0 w.p. **1/2**, else logU[1e-5, 5e-2] | same |
+
+- **Composition.** x[:,0] = 1 (dry), then the whole row is normalized to sum 1. The draws run in this order:
+  1. T, then P;
+  2. for each of species 1, 2, 3: one `torch.rand(N)` mask draw, then one logU draw;
+  3. for each of species 4..8: one mask draw, then one logU draw.
+  The logU draw is `exp(uniform_(log lo, log hi))`.
+- **Appended cell.** Cell #5000 (index 5000, the 5001st state) is the PR's test cell, appended to **both** families:
+  - T = 104.18617226219762 K, P = 1946753.4681013762 Pa;
+  - x = [0.9452025167266452, 3.0793244963643104e-06, 0, 0.04432008639206904, 0, 0.0033088825716865882, 0.007165383153972112, 0, 5.1831130667826045e-08].
+- **UV state from the same (T, P, x).** All on the device, gas constant 8.31446:
+  - c = x · P/(R T) / Σ_{gas 0..3} x (mol/m³);
+  - rho = Σ c/inv_mu;
+  - y = mass fractions of species 1..8;
+  - V = `DY->V`(rho, y);
+  - U = `VT->U`(V, T).
+- **Modes.**
+  - TP is `ThermoX.forward(T, P, x)`.
+  - UV is `ThermoY.forward(rho, U, y)` with `uv_solver('kkt')` or `'auto'`, and the final T is from `VU->T`.
+  - Every mode uses `ThermoOptions.from_yaml(tests/jupiter.yaml).max_iter(m)` with m ∈ {100, 1000}.
+  - tests/jupiter.yaml is the same blob at a40a73d3 and 6ed29f1d (14c7af56fe05).
+
+## 3. Scripts (verbatim; the only edit is the absolute path in outer.py, now `<SCRIPTDIR>`)
+
+Placeholders: `<KINTERA>` = kintera checkout; `<DECK>` = `<KINTERA>/tests/jupiter.yaml`; `<PYINSTALL>` = a `pip install --no-build-isolation --no-deps -t <PYINSTALL> .` of the build; `<SCRIPTDIR>` = folder holding these four scripts; `<OUT>` = output folder.
+
+**Run the sweep** (one output file per build and device):
+
+```bash
+cd <SCRIPTDIR>
+CUDA_VISIBLE_DEVICES= python -I sweep.py <PYINSTALL_CPU>  <DECK> cpu  <OUT>/sw-base-cpu.pt
+CUDA_VISIBLE_DEVICES=0 python -I sweep.py <PYINSTALL_CUDA> <DECK> cuda <OUT>/sw-base-gpu0.pt
+# repeat with the 6ed29f1d installs -> <OUT>/sw-head-cpu.pt, <OUT>/sw-head-gpu0.pt
+```
+
+It prints per mode: failures, status-20 count, other failures with their status codes, and `fired_cells`. `fired_cells` is nonzero only with the review's scratch-instrumented build, which encoded stop-rule events in the fractional part of diag. That build is not part of this package.
+
+**Read a cell:**
+
+```python
+import torch
+r = torch.load('<OUT>/sw-base-cpu.pt', weights_only=False)
+d, T, amt = r['cold/TP100']      # diag, T (input T for TP, final T for UV), x (TP) or c mol/m^3 (UV)
+T_in, P_in, X_in = r['cold/in']  # host-generated inputs
+rho, U, c_in = r['cold/UVin']    # device-computed UV inputs
+status20 = torch.trunc(d) == -(2000 + 100)
+```
+
+**Run the brute force** (`outer.py` with `brute.py` and `ucoef.py`; needs mpmath, and uses a Pool of 28 processes):
+
+```bash
+cd <SCRIPTDIR>
+python outer.py <DECK> <PYINSTALL_CPU> <OUT>/sw-head-cpu.pt <OUT>/sw-inst-cpu.pt <OUT>/sw-base-cpu.pt <OUT>/outer-cpu.pt
+```
+
+`outer.py` selects cells with a status change base→head or a nonzero fired flag in the 4th argument. Without the instrumented build, pass the head file as the 4th argument; then only status changes are selected. To get a reference for other cells, call `brute.eq_tp(x, T, P)` or `brute.eq_uv(c, T0, a, b, U)` directly:
+- `a, b` come from `ucoef(ThermoY(...))`;
+- each returns all 8 assemblages (H2O(l), NH3(s), NH4SH(s)) ∈ {0,1}³ with `ok` = admissible;
+- `outer.py` uses `mp.mp.dps = 50`.
+
+### sweep.py
+
+```python
+"""K19 review sweep over tests/jupiter.yaml.
+usage: python -I sweep.py <pyinstall> <yaml> <cpu|cuda> <out.pt>
+Two 5000-state families, generated on the host with torch.Generator seed 0 / 1,
+so every device sees bit-identical inputs:
+  wide: T ~ U[100, 350] K, P ~ logU[1e4, 1e7] Pa, dry 1, each of H2O/NH3/H2S zero
+        w.p. 1/4 else logU[1e-5, 5e-2], each of the 5 clouds zero w.p. 1/2 else
+        logU[1e-8, 1e-2]; normalized.
+  cold: same, but T ~ U[100, 110] K and NH3 gas zero w.p. 1/2.
+  plus the PR's test cell (UV 1955 of Linfeng's sweep) appended as the last state.
+Modes: TP and UV(kkt) at max_iter 100 and 1000, UV(auto) at 100.
+"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import torch, kintera
+from kintera import ThermoOptions, ThermoY, ThermoX
+
+torch.set_default_dtype(torch.float64)
+yaml, dev, out = sys.argv[2], torch.device(sys.argv[3]), sys.argv[4]
+N, NS = 5000, 9
+CELL = ([0.9452025167266452, 3.0793244963643104e-06, 0.0, 0.04432008639206904, 0.0,
+         0.0033088825716865882, 0.007165383153972112, 0.0, 5.1831130667826045e-08],
+        104.18617226219762, 1946753.4681013762)
+
+
+def lu(g, n, lo, hi):
+    return torch.exp(torch.empty(n).uniform_(torch.log(torch.tensor(lo)).item(),
+                                             torch.log(torch.tensor(hi)).item(), generator=g))
+
+
+def states(seed, tlo, thi, p_nh3_zero):
+    g = torch.Generator().manual_seed(seed)
+    T = torch.empty(N).uniform_(tlo, thi, generator=g)
+    P = lu(g, N, 1e4, 1e7)
+    X = torch.zeros(N, NS)
+    X[:, 0] = 1.
+    for i in (1, 2, 3):
+        pz = p_nh3_zero if i == 2 else 0.25
+        X[:, i] = torch.where(torch.rand(N, generator=g) < pz, 0., lu(g, N, 1e-5, 5e-2))
+    for i in range(4, 9):
+        X[:, i] = torch.where(torch.rand(N, generator=g) < 0.5, 0., lu(g, N, 1e-8, 1e-2))
+    X /= X.sum(-1, keepdim=True)
+    X = torch.cat([X, torch.tensor([CELL[0]])])
+    T = torch.cat([T, torch.tensor([CELL[1]])])
+    P = torch.cat([P, torch.tensor([CELL[2]])])
+    return T, P, X
+
+
+res = {"kintera": kintera.__file__}
+for fam, args in {"wide": (0, 100., 350., 0.25), "cold": (1, 100., 110., 0.5)}.items():
+    T, P, X = (t.to(dev) for t in states(*args))
+    res[fam + "/in"] = (T.cpu(), P.cpu(), X.cpu())
+    n = T.numel()
+    for mi in (100, 1000):
+        op = ThermoOptions.from_yaml(yaml).max_iter(mi)
+        tx = ThermoX(op); tx.to(dev)
+        x = X.clone(); d = torch.zeros(n, 1, device=dev)
+        tx.forward(T, P, x, False, d)
+        res[f"{fam}/TP{mi}"] = (d.cpu().squeeze(-1), T.cpu(), x.cpu())
+    for solver, mis in (("kkt", (100, 1000)), ("auto", (100,))):
+        for mi in mis:
+            op = ThermoOptions.from_yaml(yaml).max_iter(mi).uv_solver(solver)
+            th = ThermoY(op); th.to(dev)
+            inv_mu = th.buffer("inv_mu")
+            c = X * (P / (8.31446 * T) / X[:, :4].sum(-1))[:, None]
+            rho = (c / inv_mu).sum(-1)
+            y = (c[:, 1:] / inv_mu[1:] / rho[:, None]).T.contiguous()
+            V = th.compute("DY->V", [rho, y])
+            U = th.compute("VT->U", [V, T])
+            d = torch.zeros(n, 1, device=dev)
+            th.forward(rho, U, y, False, d)
+            V = th.compute("DY->V", [rho, y])
+            Tf = th.compute("VU->T", [V, U])
+            res[f"{fam}/UV{solver}{mi}"] = (d.cpu().squeeze(-1), Tf.cpu(), (V * inv_mu).cpu())
+            if mi == 100 and solver == "kkt":
+                res[f"{fam}/UVin"] = (rho.cpu(), U.cpu(), c.cpu())
+torch.save(res, out)
+for k, v in res.items():
+    if k.endswith("in") or k == "kintera":
+        continue
+    d, mi = v[0], int(k.split("TP")[-1].split("kkt")[-1].split("auto")[-1])
+    fires = ((d - torch.trunc(d)).abs() * 1000).round()
+    d = torch.trunc(d)
+    st20 = d == -(2000 + mi)
+    other = (d < 0) & ~st20
+    print(k, "fail", int((d < 0).sum()), "st20", int(st20.sum()), "other", int(other.sum()),
+          sorted(set(int(-z) for z in d[other].tolist()))[:12], "fired_cells", int((fires > 0).sum()))
+print(res["kintera"])
+```
+
+### brute.py
+
+```python
+"""Independent brute-force references for the K19 review (no kintera solver involved).
+qp(A,b,C,d): min ||A x - b||^2 s.t. C x <= d by enumerating active sets (mpmath, 300 digits).
+eq_uv / eq_tp: tests/jupiter.yaml equilibrium by enumerating the 8 cloud assemblages of
+H2O(l), NH3(s), NH4SH(s); svp formulas copied from src/vapors/vapor_functions.h, and the
+caloric model U = sum c_i (a_i + b_i T) whose coefficients are read off kintera's "VT->U"
+state function (linearity checked by the caller)."""
+import itertools
+import math
+import mpmath as mp
+
+mp.mp.dps = 300
+R = mp.mpf("8.31446")
+LN10 = mp.log(10)
+
+
+def _ideal(T, tr, pr, bl, gl, bs, gs):
+    t = T / tr
+    b, g = (bl, gl) if T > tr else (bs, gs)
+    return (1 - 1 / t) * b - g * mp.log(t) + mp.log(pr)
+
+
+def lsvp(j, T):
+    if j == 0:
+        return _ideal(T, mp.mpf("273.16"), mp.mpf("611.7"), mp.mpf("24.845"), mp.mpf("4.986009"),
+                      mp.mpf("22.98"), mp.mpf("0.52"))
+    if j == 1:
+        return _ideal(T, mp.mpf("195.4"), mp.mpf("6060."), mp.mpf("20.08"), mp.mpf("5.62"),
+                      mp.mpf("20.64"), mp.mpf("1.43"))
+    return (mp.mpf("14.82") - 4705 / T) * LN10 + 2 * mp.log(mp.mpf(101325))
+
+
+def qp(A, b, C, d):
+    n2, n3 = len(b), len(d)
+    A, b, C, d = mp.matrix(A), mp.matrix(b), mp.matrix(C), mp.matrix(d)
+    H, g = A.T * A, A.T * b
+    rows = [i for i in range(n3) if any(C[i, j] != 0 for j in range(n2))]
+    scale = max([abs(x) for x in d] + [mp.mpf(1e-300)])
+    cands = []
+    for k in range(0, n2 + 1):
+        for S in itertools.combinations(rows, k):
+            K = mp.zeros(n2 + k, n2 + k)
+            r = mp.zeros(n2 + k, 1)
+            for i in range(n2):
+                for j in range(n2):
+                    K[i, j] = H[i, j]
+                r[i] = g[i]
+            for a, i in enumerate(S):
+                for j in range(n2):
+                    K[n2 + a, j] = C[i, j]
+                    K[j, n2 + a] = C[i, j]
+                r[n2 + a] = d[i]
+            try:
+                z = mp.lu_solve(K, r)
+            except ZeroDivisionError:
+                continue
+            x = [z[i] for i in range(n2)]
+            viol = max([sum(C[i, j] * x[j] for j in range(n2)) - d[i] for i in rows] + [mp.mpf(0)])
+            res = A * mp.matrix(x) - b
+            obj = sum(v * v for v in res)
+            # KKT: A^T (A x - b) + C_S^T lam = 0 with lam >= 0 at the optimum; z holds lam
+            lam = [z[n2 + a] for a in range(k)]
+            cands.append(dict(S=S, x=x, obj=obj, viol=viol / scale, lam=lam))
+    # same allowance as the solver's own origin check: 64 eps of max|d|
+    feas = [c for c in cands if c["viol"] <= 64 * mp.mpf(2) ** -52]
+    best = min(feas, key=lambda c: c["obj"])
+    return best, feas
+
+
+def objective(A, b, x):
+    A, b = mp.matrix(A), mp.matrix(b)
+    r = A * mp.matrix([mp.mpf(v) for v in x]) - b
+    return sum(v * v for v in r)
+
+
+def violation(C, d, x):
+    n2 = len(x)
+    return max(sum(mp.mpf(C[i][j]) * mp.mpf(x[j]) for j in range(n2)) - mp.mpf(d[i]) for i in range(len(d)))
+
+
+# --- equilibrium -----------------------------------------------------------------------
+# species: 0 dry, 1 H2O, 2 NH3, 3 H2S, 4 H2O(l), 5 H2O(l,p), 6 NH3(s), 7 NH3(s,p), 8 NH4SH(s)
+
+def _split(c, logs, mask):
+    W, N, S = c[1] + c[4], c[2] + c[6] + c[8], c[3] + c[8]
+    g = [mp.e ** l if l is not None else mp.mpf(0) for l in logs]
+    c4 = W - g[0] if mask[0] else mp.mpf(0)
+    c8 = S - g[2] if mask[2] else mp.mpf(0)
+    c6 = N - g[1] - c8 if mask[1] else mp.mpf(0)
+    return g, c4, c6, c8, (W, N, S)
+
+
+def _resid(T, g, c4, c6, c8, tot, mask, lp, live):
+    W, N, S = tot
+    f = []
+    if live[0]:
+        f.append(lp[0] - lsvp(0, T) if mask[0] else g[0] / W - 1)
+    if live[1]:
+        f.append(lp[1] - lsvp(1, T) if mask[1] else (g[1] + c8) / N - 1)
+    if live[2]:
+        f.append(lp[1] + lp[2] - lsvp(2, T) if mask[2] else g[2] / S - 1)
+    return f
+
+
+def _admissible(T, g, c4, c6, c8, mask, lp, tol=1e-9):
+    for m, a in zip(mask, [c4, c6, c8]):
+        if m and a < 0:
+            return False
+    ninf = mp.mpf("-1e400")
+    l = [v if v is not None else ninf for v in lp]
+    sat = [l[0] - lsvp(0, T), l[1] - lsvp(1, T), l[1] + l[2] - lsvp(2, T)]
+    return all(m or s_ <= tol for m, s_ in zip(mask, sat))
+
+
+def _solve(c, T0, mask, ptot, uv=None):
+    """Gases with a zero element total are fixed at zero, and the clouds that need them are
+    absent; the remaining unknowns are the log amounts of the live gases (and T for UV)."""
+    c = [mp.mpf(v) for v in c]
+    W, N, S = c[1] + c[4], c[2] + c[6] + c[8], c[3] + c[8]
+    live = [W > 0, N > 0, S > 0]
+    if (mask[0] and not live[0]) or ((mask[1] or mask[2]) and not live[1]) or (mask[2] and not live[2]):
+        return None
+    tot = (W, N, S)
+    for fr in ("0.5", "0.9", "0.01", "1e-6", "1e-12"):
+        f = mp.mpf(fr)
+        s0 = [mp.log(W * (f if mask[0] else 1)) if live[0] else None,
+              mp.log(N * (f if (mask[1] or mask[2]) else 1)) if live[1] else None,
+              mp.log(S * (f if mask[2] else 1)) if live[2] else None]
+        idx = [k for k in range(3) if live[k]]
+
+        def unpack(v):
+            logs = [None, None, None]
+            for n, k in enumerate(idx):
+                logs[k] = v[n]
+            T = v[len(idx)] if uv else mp.mpf(T0)
+            return logs, T
+
+        def F(*v):
+            logs, T = unpack(v)
+            g, c4, c6, c8, _ = _split(c, logs, mask)
+            lp = ptot(T, g, c4, c6, c8)
+            f = _resid(T, g, c4, c6, c8, tot, mask, lp, live)
+            if uv:
+                a, b, U = uv
+                cc = [c[0], g[0], g[1], g[2], c4, c[5], c6, c[7], c8]
+                f.append(sum(ci * (ai + bi * T) for ci, ai, bi in zip(cc, a, b)) / U - 1)
+            return f
+        x0 = [s0[k] for k in idx] + ([mp.mpf(T0)] if uv else [])
+        try:
+            sol = mp.findroot(F, x0, tol=mp.mpf(10) ** -(mp.mp.dps - 12), maxsteps=200)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            continue
+        sol = [sol[n] for n in range(len(x0))] if len(x0) > 1 else [sol]
+        logs, T = unpack(sol)
+        g, c4, c6, c8, _ = _split(c, logs, mask)
+        lp = ptot(T, g, c4, c6, c8)
+        return dict(T=T, c=[c[0], g[0], g[1], g[2], c4, c[5], c6, c[7], c8], lp=lp,
+                    ok=_admissible(T, g, c4, c6, c8, mask, lp))
+    return "nosol"
+
+
+def eq_uv(c, T0, a, b, U):
+    def ptot(T, g, c4, c6, c8):
+        return [mp.log(gi * R * T) if gi > 0 else None for gi in g]
+    out = {}
+    for mask in itertools.product((0, 1), repeat=3):
+        out[mask] = _solve(c, T0, mask, ptot, uv=([mp.mpf(v) for v in a], [mp.mpf(v) for v in b], mp.mpf(U)))
+    return out
+
+
+def eq_tp(x, T, P):
+    P = mp.mpf(P)
+    x0 = [mp.mpf(v) for v in x]
+
+    def ptot(T, g, c4, c6, c8):
+        ng = x0[0] + g[0] + g[1] + g[2]
+        return [mp.log(P * gi / ng) if gi > 0 else None for gi in g]
+    out = {}
+    for mask in itertools.product((0, 1), repeat=3):
+        r = _solve(x, T, mask, ptot)
+        if isinstance(r, dict):
+            tot = sum(r["c"])
+            r["x"] = [ci / tot for ci in r["c"]]
+        out[mask] = r
+    return out
+```
+
+### ucoef.py
+
+```python
+import torch
+
+
+def ucoef(th, dev="cpu"):
+    """U = sum c_i (a_i + b_i T), c in mol/m^3, from kintera's VT->U state function (V = mass
+    density = c / inv_mu); returns per-mole a, b and the max relative nonlinearity."""
+    n = th.buffer("inv_mu").numel()
+    E = torch.eye(n, dtype=torch.float64, device=dev)
+    u1 = th.compute("VT->U", [E, torch.full((n,), 100., device=dev)])
+    u2 = th.compute("VT->U", [E, torch.full((n,), 200., device=dev)])
+    u3 = th.compute("VT->U", [E, torch.full((n,), 150., device=dev)])
+    b = (u2 - u1) / 100.
+    a = u1 - 100. * b
+    nonlin = ((u3 - (a + 150. * b)).abs() / u3.abs().clamp_min(1e-300)).max().item()
+    inv_mu = th.buffer("inv_mu")
+    return (a / inv_mu).cpu().tolist(), (b / inv_mu).cpu().tolist(), nonlin
+```
+
+### outer.py
+
+```python
+"""Outer brute-force equilibrium for selected cells vs the solver's accepted state.
+usage: outer.py <yaml> <pyinstall> head.pt inst.pt base.pt out.pt"""
+import sys
+sys.path.insert(0, sys.argv[2]); sys.path.insert(0, "<SCRIPTDIR>")
+import torch, mpmath as mp
+from multiprocessing import Pool
+import brute
+from ucoef import ucoef
+torch.set_default_dtype(torch.float64)
+H, I, B = torch.load(sys.argv[3]), torch.load(sys.argv[4]), torch.load(sys.argv[5])
+
+
+def status(d, mi):
+    d = torch.trunc(d)
+    return 0 if d >= 0 else (20 if d == -(2000 + mi) else int(-d) // 100)
+
+
+def work(job):
+    mp.mp.dps = 50
+    m, i, kind, inp, a, b = job
+    if kind == "TP":
+        T, P, X = inp
+        sols = brute.eq_tp(X, T, P)
+    else:
+        T0, U, c = inp
+        sols = brute.eq_uv(c, T0, a, b, U)
+    adm = {k: v for k, v in sols.items() if isinstance(v, dict) and v["ok"]}
+    return m, i, adm, {k: (v if not isinstance(v, dict) else None) for k, v in sols.items() if not isinstance(v, dict)}
+
+
+if __name__ == "__main__":
+    from kintera import ThermoOptions, ThermoY
+    th = ThermoY(ThermoOptions.from_yaml(sys.argv[1]))
+    a, b, nl = ucoef(th)
+    jobs = []
+    for m in ["wide/TP100", "wide/UVkkt100", "cold/TP100", "cold/UVkkt100"]:
+        fam, mode = m.split("/")
+        d = I[m][0]
+        fired = (((d - torch.trunc(d)).abs() * 1000).round() > 0)
+        sh = torch.tensor([status(v, 100) for v in H[m][0]])
+        sb = torch.tensor([status(v, 100) for v in B[m][0]])
+        sel = (fired | (sh != sb)).nonzero().squeeze(-1).tolist()
+        for i in sel:
+            if mode.startswith("TP"):
+                T, P, X = (t[i].tolist() for t in B[fam + "/in"])
+                jobs.append((m, i, "TP", (T, P, X), a, b))
+            else:
+                rho, U, c = B[fam + "/UVin"]
+                jobs.append((m, i, "UV", (B[fam + "/in"][0][i].item(), U[i].item(), c[i].tolist()), a, b))
+    with Pool(28) as p:
+        R = p.map(work, jobs, chunksize=1)
+    out = []
+    for (m, i, adm, bad), job in zip(R, jobs):
+        fam = m.split("/")[0]
+        d = I[m][0][i]
+        rec = dict(mode=m, cell=i, fired=int(((d - torch.trunc(d)).abs() * 1000).round()),
+                   head=status(H[m][0][i], 100), base=status(B[m][0][i], 100), nadm=len(adm), unsolved=list(bad))
+        if len(adm) >= 1:
+            ref = min(adm.values(), key=lambda v: 0)  # report all below
+            rec["assemblages"] = list(adm)
+            for tag, S in (("head", H), ("base", B)):
+                if rec[tag] != 0:
+                    continue
+                diffs = []
+                for k, v in adm.items():
+                    if m.endswith("TP100"):
+                        got = S[m][2][i].tolist(); want = v["x"]; dT = 0.
+                    else:
+                        got = S[m][2][i].tolist(); want = v["c"]; dT = abs(float(v["T"]) - S[m][1][i].item())
+                    ab = [abs(float(w) - g) for w, g in zip(want, got)]
+                    rl = [abs(float(w) - g) / abs(float(w)) for w, g in zip(want, got) if abs(float(w)) > 1e-30]
+                    rl0 = [abs(g) for w, g in zip(want, got) if abs(float(w)) <= 1e-30]
+                    diffs.append((max(ab), max(rl), max(rl0 + [0.]), dT, k))
+                rec[tag + "_diff"] = min(diffs)
+            rec["refT"] = [float(v["T"]) for v in adm.values()]
+        out.append(rec)
+    torch.save(out, sys.argv[6])
+    for r in out:
+        print(r)
+```
+
+## 4. Build configuration
+
+| | CPU install | CUDA install |
+|---|---|---|
+| kintera commits | a40a73d331f487cd782fbff49c887505733dbf8b (base); 6ed29f1d7c6af45eaba92c7027689f5529fb2044 (head) | same two |
+| kintera version (dist-info) | 2.6.6.dev49+ga40a73d33 / 2.6.6.dev50+g6ed29f1d7 | same |
+| cmake | `cmake -B build` (README path), `CUDA=OFF`, `CMAKE_BUILD_TYPE=Release` (-O3 -DNDEBUG), Unix Makefiles, BUILD_TESTS=ON | `CUDA=ON`; build type empty in cache, so CMakeLists defaults to Release (-O3 -DNDEBUG); nvcc flags `--extended-lambda --expt-relaxed-constexpr -std=c++17`, gencode sm_60 61 70 75 80 86 89 90 120 |
+| build / install | `cmake --build build --parallel`, then `pip install --no-build-isolation --no-deps -t <PYINSTALL> .` | same |
+| compilers | GCC 12.2.1 (gcc-toolset-12) | GCC 12.2.1 + nvcc 12.9.86 |
+| Python | 3.11.13 | 3.11.13 |
+| torch | 2.10.0+cu126 (CUDA 12.6 runtime) | same |
+| other | numpy 2.4.6, scipy 1.17.1, pyharp 2.7.6, pydisort 1.8.13 (DISORT linked); mpmath 1.3.0 for the brute force | same |
+| GPU | – | NVIDIA GeForce GTX 1080 Ti (sm_61), driver 580.178.04; GPU0 used (GPU1 only at 75d0e3a2) |
+
+- **Library check.** Each sweep output records `kintera.__file__`, and it points at that tag's install.
+- **Review results for the same builds.** ctest 49/49 at base and 50/50 at head. pytest went from 431 passed / 172 skipped to 432/172 on CPU, and from 609/4 to 611/4 on CUDA.
+
+## 5. Status-20 counts per sweep
+
+Cells are 5001 per family. Each entry is `all (without #5000)`.
+
+| device | commit | max_iter | wide TP | wide UV(kkt) | cold TP | cold UV(kkt) |
+|---|---|---|---|---|---|---|
+| CPU | a40a73d3 | 100 | 126 (125) | 3 (3) | 208 (207) | 41 (41) |
+| CPU | a40a73d3 | 1000 | 124 (124) | 3 (3) | 179 (179) | 41 (41) |
+| CPU | 6ed29f1d | 100 | 126 (125) | 3 (3) | 215 (214) | 47 (47) |
+| CPU | 6ed29f1d | 1000 | 124 (124) | 3 (3) | 186 (186) | 47 (47) |
+| GPU0 | a40a73d3 | 100 | 127 (126) | 1 (1) | 211 (210) | 36 (36) |
+| GPU0 | a40a73d3 | 1000 | 125 (125) | 1 (1) | 182 (182) | 36 (36) |
+| GPU0 | 6ed29f1d | 100 | 127 (126) | 1 (1) | 215 (214) | 43 (43) |
+| GPU0 | 6ed29f1d | 1000 | 125 (125) | 1 (1) | 186 (186) | 43 (43) |
+
+UV(auto) at max_iter 100 is bit-identical to UV(kkt) at 100 in every file, so its counts are the same.
+
+Other failure codes, for context: the only other failure code is status 2. At base, status 2 counts on CPU are 3 / 6 / 47 / 88 and on GPU0 9 / 7 / 92 / 106. At head they are 0 / 0 / 0 / 3 on CPU and 0 / 0 / 0 / 1 on GPU0. These are the same at max_iter 1000.
+
+**Base→head transitions of the max_iter 100 rows:**
+
+| device | sweep | mode | 20→20 | 20→0 | 2→20 |
+|---|---|---|---|---|---|
+| cpu | wide | TP | 126 | 0 | 0 |
+| cpu | wide | UVkkt | 3 | 0 | 0 |
+| cpu | cold | TP | 207 | 1 | 8 |
+| cpu | cold | UVkkt | 41 | 0 | 6 |
+| gpu0 | wide | TP | 127 | 0 | 0 |
+| gpu0 | wide | UVkkt | 1 | 0 | 0 |
+| gpu0 | cold | TP | 208 | 3 | 7 |
+| gpu0 | cold | UVkkt | 36 | 0 | 7 |
+
+- **20→20 rows.** All but 56 are bit-identical at head; those rows show `=`. The 56 (cold only: CPU 25 TP + 3 UV, GPU0 26 TP + 2 UV) differ by at most 1.1e-17 in any printed amount.
+- **20→0 at head.** CPU cold TP 682. GPU0 cold TP 682, 895 and 3103.
+- **2→20 movers.** CPU cold TP 91, 1401, 2821, 3757, 3939, 4033, 4300, 4880; CPU cold UV 167, 253, 2697, 4506, 4547, 4949. GPU0 cold TP 91, 2821, 3757, 3939, 4033, 4300, 4880; GPU0 cold UV 167, 253, 965, 1723, 3103, 4078, 4201.
+- **max_iter 100 → 1000.** At base, 2 wide TP and 29 cold TP cells that are status 20 at max_iter 100 converge at max_iter 1000 on both devices. No UV status-20 cell converges with more iterations.
+- **States of cells that stay status 20 from max_iter 100 to 1000.** Their states differ by at most 7.8e-17 (TP x) and 1.7e-29 mol/m³ (UV), and their final T is identical. Section 6b has the per-cell values.
+
+## 6. Per-cell tables
+
+Section 6a is every cell that is status 20 at max_iter 100 at base or head (781 rows). Section 6b covers max_iter 1000 (719 rows). Together they are more than 600 rows, so both are full CSVs. To keep the document under 200 KB, the max_iter 1000 rows give the difference from the same cell's max_iter 100 row instead of repeating the state. Every max_iter 1000 status-20 cell is also status 20 at max_iter 100 on the same device and commit (checked).
+
+### Columns of 6a
+
+- **Identity.** `device` (cpu = CPU build on CPU, gpu0 = CUDA build on GPU0), `sweep` (wide/cold), `mode` (TP or UVkkt), `max_iter`, `cell` (index in the family; 5000 is the PR cell).
+- **Inputs.** `T_in_K`, `P_in_Pa` are the generating inputs; for UV, T_in is only the starting T used to build U. `rho_kg_m3`, `U_J_m3` are the UV inputs on that device.
+- **Base state.**
+  - `base_status`, `base_iter` are decoded from diag.
+  - `base_T_K` is the final T (UV only; TP is isothermal at T_in).
+  - `b_dry … b_NH4SH_s` are the final amounts in the order 0..8 above. TP: mole fractions. UV: mol/m³.
+- **Head state.** `head_*` is `=` when the head result is bit-identical (status, iter, T and amounts); otherwise it gives status, iter, T (UV) and the 9 amounts joined by `|`.
+- **`bruteforce`.**
+  - `ref abc T=…` is the unique admissible brute-force assemblage. a, b, c mark H2O(l), NH3(s), NH4SH(s) as present (1) or absent (0); T is the reference temperature.
+  - `head dev abs/rel[/dT]` is the earlier max abs and max rel amount deviation of the converged head state from the reference.
+  - `not computed` means no brute force was run for this cell.
+  - All values are at 6 significant digits.
+
+### 6a. max_iter 100, status 20 at base or head
+
+```csv
+device,sweep,mode,max_iter,cell,T_in_K,P_in_Pa,rho_kg_m3,U_J_m3,base_status,base_iter,base_T_K,b_dry,b_H2O,b_NH3,b_H2S,b_H2O_l,b_H2O_lp,b_NH3_s,b_NH3_sp,b_NH4SH_s,head_status,head_iter,head_T_K,head_amounts,bruteforce
+cpu,wide,TP,100,38,299.014652,190110,,,20,100,,0.993694,0.00225815,0,0.000323237,0,0.00371823,6.22423e-06,0,0,=,,,,not computed
+cpu,wide,TP,100,63,349.670241,20209.2,,,20,100,,0.998317,0,0.000141164,1.15375e-05,1.64509e-06,0.00152896,0,0,0,=,,,,not computed
+cpu,wide,TP,100,69,302.381488,13661.2,,,20,100,,0.999148,0.000543841,0,0,0,0,1.7439e-06,0,0.0003067,=,,,,not computed
+cpu,wide,TP,100,70,297.246299,165407,,,20,100,,0.972949,0.0130136,0,0.0140376,0,0,1.7853e-07,6.48909e-08,0,=,,,,not computed
+cpu,wide,TP,100,229,298.171005,55845,,,20,100,,0.981902,0.0166209,0,0,0,0.00146843,8.90268e-06,0,0,=,,,,not computed
+cpu,wide,TP,100,265,348.290179,26352.7,,,20,100,,0.999794,0,7.29107e-05,5.31283e-05,7.98043e-05,0,0,0,0,=,,,,not computed
+cpu,wide,TP,100,267,342.007039,117937,,,20,100,,0.973133,0.0258316,0,0.00103204,0,0,3.63697e-06,0,0,=,,,,not computed
+cpu,wide,TP,100,276,335.385026,22860.2,,,20,100,,0.99987,8.97918e-05,0,0,0,7.37623e-06,3.26343e-05,0,0,=,,,,not computed
+cpu,wide,TP,100,344,345.492278,55295.9,,,20,100,,0.993985,1.55521e-05,0,0.00419854,0,0.00180095,1.36349e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,388,346.001081,206797,,,20,100,,0.994855,0.0051127,0,3.05653e-05,0,1.44902e-07,9.54423e-08,1.37579e-06,0,=,,,,not computed
+cpu,wide,TP,100,395,349.153390,58813.9,,,20,100,,0.994114,0.00069569,0,0,0,0.000181851,0.000411882,0.00459683,0,=,,,,not computed
+cpu,wide,TP,100,409,284.189620,28371.3,,,20,100,,0.999015,3.38034e-05,0,0,0,1.71853e-08,0.000942748,9.05174e-07,7.3399e-06,=,,,,not computed
+cpu,wide,TP,100,490,309.668177,32999.2,,,20,100,,0.998194,6.75098e-06,0,0,0,0,0.00179905,0,0,=,,,,not computed
+cpu,wide,TP,100,518,336.149019,1.08987e+06,,,20,100,,0.988664,0.00011876,0,0.00059589,0,0,0.00896318,0.00165809,0,=,,,,not computed
+cpu,wide,TP,100,543,284.680323,27341.2,,,20,100,,0.999863,4.52727e-05,0,0,0,0,8.39974e-07,7.05568e-05,2.04194e-05,=,,,,not computed
+cpu,wide,TP,100,572,333.267822,13362.7,,,20,100,,0.99674,0,0.00113118,0.00126732,0.000861738,0,0,0,0,=,,,,not computed
+cpu,wide,TP,100,573,336.955791,934785,,,20,100,,0.998266,8.00436e-05,0,0.00122305,0,0,0.000430695,0,0,=,,,,not computed
+cpu,wide,TP,100,606,257.989458,155987,,,20,100,,0.989076,1.11183e-08,0,0.00761392,0,0.00325966,5.01233e-05,0,0,=,,,,not computed
+cpu,wide,TP,100,617,348.355556,1.01457e+06,,,20,100,,0.98384,2.71744e-05,0,0.0156833,0,0.00044896,1.20622e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,643,298.465679,550377,,,20,100,,0.983006,0.00577357,0,5.05873e-05,0.00828347,0.00265945,0.00019963,2.7469e-05,0,=,,,,not computed
+cpu,wide,TP,100,740,314.853237,267174,,,20,100,,0.995492,0.00047444,0,0.00403347,0,0,4.17113e-08,0,0,=,,,,not computed
+cpu,wide,TP,100,755,328.183154,158364,,,20,100,,0.994309,0.00222383,0,0.00322166,0,0,0.000245398,3.52891e-08,0,=,,,,not computed
+cpu,wide,TP,100,784,285.841915,41876.3,,,20,100,,1,0,0,0,0,3.51533e-08,1.03424e-08,0,0,=,,,,not computed
+cpu,wide,TP,100,786,349.730259,157656,,,20,100,,0.996248,0.00368105,0,0,0,7.0542e-05,0,0,2.15081e-08,=,,,,not computed
+cpu,wide,TP,100,851,336.631855,55945,,,20,100,,0.965045,0.0309429,0,0,0,0.00401042,0,0,1.52483e-06,=,,,,not computed
+cpu,wide,TP,100,876,335.655340,108548,,,20,100,,0.999246,0,0,0,0,0.000175001,0.000577364,1.84075e-06,0,=,,,,not computed
+cpu,wide,TP,100,967,271.752581,67003.5,,,20,100,,0.991165,0,0,0.00510472,0,0,0.00180874,0.00192165,0,=,,,,not computed
+cpu,wide,TP,100,973,331.859012,49335.3,,,20,100,,0.991796,0.000552161,0,0.000585355,0,0.00706493,5.11597e-07,8.1239e-07,0,=,,,,not computed
+cpu,wide,TP,100,997,316.956673,273234,,,20,100,,0.995378,0.00054035,0,0.00269329,0,0,0.0013879,0,0,=,,,,not computed
+cpu,wide,TP,100,1036,343.786087,294645,,,20,100,,0.99969,0.000107837,0,0,0,0.000194028,9.40554e-08,0,8.28134e-06,=,,,,not computed
+cpu,wide,TP,100,1049,333.409055,15527,,,20,100,,0.99741,0,0.000436907,0,1.42427e-08,0.00215269,0,0,0,=,,,,not computed
+cpu,wide,TP,100,1085,340.372048,72495.7,,,20,100,,0.994025,0.00176392,0,0,0,0,0.00421092,0,0,=,,,,not computed
+cpu,wide,TP,100,1125,322.929879,94349.5,,,20,100,,0.99732,0.00172042,0,0.000959083,0,0,7.93286e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,1218,258.675916,101599,,,20,100,,0.999632,0.000306996,0,5.87388e-05,0,5.42926e-07,2.01133e-06,0,0,=,,,,not computed
+cpu,wide,TP,100,1331,289.549704,178130,,,20,100,,0.989784,8.65373e-05,0,0.0101279,0,0,5.41081e-07,1.04555e-06,0,=,,,,not computed
+cpu,wide,TP,100,1374,318.851550,44863.9,,,20,100,,0.996354,0.000604174,0,0.00302536,0,8.91854e-07,1.5227e-05,2.78499e-08,0,=,,,,not computed
+cpu,wide,TP,100,1379,289.402124,13113,,,20,100,,0.994761,0.00093373,0,0,0,6.52986e-08,0.00248599,0.00175981,5.99036e-05,=,,,,not computed
+cpu,wide,TP,100,1419,309.178441,27088.5,,,20,100,,0.952132,0.0388908,0,0.00091789,0,0.00805921,5.51731e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,1545,301.848446,28110.2,,,20,100,,0.95956,0.0404343,0,0,0,0,1.62806e-06,4.34763e-06,0,=,,,,not computed
+cpu,wide,TP,100,1551,257.698553,113263,,,20,100,,0.995916,0.000780841,0,0.00319611,0,3.04858e-06,0.000104022,0,0,=,,,,not computed
+cpu,wide,TP,100,1566,221.579326,16877.3,,,20,100,,0.997254,0,0,0.00271736,0,9.85222e-06,1.82977e-05,2.11818e-07,0,=,,,,not computed
+cpu,wide,TP,100,1656,214.168792,16267.6,,,20,100,,0.991276,0,0,8.92414e-05,0,0.00789761,0.000737283,0,0,=,,,,not computed
+cpu,wide,TP,100,1732,266.082779,56613.6,,,20,100,,0.944062,0.00583791,0,0.0380649,0.0119365,3.88641e-07,1.42343e-05,8.36763e-05,0,=,,,,not computed
+cpu,wide,TP,100,1788,337.402451,756090,,,20,100,,0.966669,0.000875669,0,0.027575,0,5.23387e-06,0.00487483,4.62718e-07,0,=,,,,not computed
+cpu,wide,TP,100,1823,288.009364,54011.4,,,20,100,,1,0,0,0,0,2.35466e-08,6.94373e-08,0,0,=,,,,not computed
+cpu,wide,TP,100,1827,349.266040,62540.3,,,20,100,,0.96208,0.0378256,0,8.58889e-05,0,1.96357e-07,8.22711e-06,0,0,=,,,,not computed
+cpu,wide,TP,100,1842,341.069676,313015,,,20,100,,0.997692,0.00223587,0,6.78336e-05,0,3.61486e-06,1.79691e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,1951,321.522150,146899,,,20,100,,0.953832,0.0379932,0,0.000286905,0,0,0.00788803,3.79027e-07,0,=,,,,not computed
+cpu,wide,TP,100,1990,274.935898,20203.7,,,20,100,,0.999941,6.55003e-07,0,4.94907e-05,0,8.97645e-06,2.54694e-08,0,0,=,,,,not computed
+cpu,wide,TP,100,2086,324.426290,87310.6,,,20,100,,0.988072,0.011895,0,3.08509e-05,0,0,2.6039e-06,0,0,=,,,,not computed
+cpu,wide,TP,100,2140,314.473207,30423.2,,,20,100,,0.979431,0.000206369,0,0.0197295,0,1.96701e-07,0.000632622,0,0,=,,,,not computed
+cpu,wide,TP,100,2174,341.567568,567283,,,20,100,,0.999818,7.5675e-05,0,9.48014e-05,0,1.31843e-08,1.17871e-06,1.02132e-05,0,=,,,,not computed
+cpu,wide,TP,100,2270,105.783191,241672,,,20,100,,0.978052,6.68816e-19,1.74438e-19,0.0193633,0.0025684,0,4.91793e-19,0,1.65135e-05,=,,,,not computed
+cpu,wide,TP,100,2281,274.118915,56310.6,,,20,100,,0.993441,0.00649034,0,5.10192e-05,0,0,1.75659e-05,0,0,=,,,,not computed
+cpu,wide,TP,100,2289,337.267371,13296.3,,,20,100,,0.999965,0,0,0,3.6117e-06,0,0,0,3.12125e-05,=,,,,not computed
+cpu,wide,TP,100,2333,263.380770,80371.9,,,20,100,,0.994491,0.000308367,0,0,0,3.20745e-06,0.00390419,0.00129276,0,=,,,,not computed
+cpu,wide,TP,100,2341,327.412573,216061,,,20,100,,0.999616,6.03896e-05,0,0,0,0.000287179,3.67656e-05,3.83858e-08,0,=,,,,not computed
+cpu,wide,TP,100,2351,313.531940,27953.9,,,20,100,,0.992326,0.00210521,0,2.26147e-05,0,0.00554546,3.62389e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,2447,100.112503,443593,,,20,100,,0.996909,1.30352e-20,3.76992e-21,0.00254658,0.000465367,0,7.44998e-20,7.86641e-05,4.38836e-07,=,,,,not computed
+cpu,wide,TP,100,2495,342.003482,14774.2,,,20,100,,0.999891,6.12907e-05,0,0,0,0,1.24272e-06,0,4.65772e-05,=,,,,not computed
+cpu,wide,TP,100,2513,345.083650,30292.7,,,20,100,,0.993824,0.00448086,0,0.000691141,0,0,0.00100351,0,0,=,,,,not computed
+cpu,wide,TP,100,2541,238.948937,41715.8,,,20,100,,0.997141,0.000583903,0,1.86211e-05,0.00222433,4.52044e-06,2.58953e-05,1.77212e-06,0,=,,,,not computed
+cpu,wide,TP,100,2556,100.478136,9.52723e+06,,,20,100,,0.982336,7.48905e-22,3.30344e-33,0.00119208,0.0122826,0,0,3.12476e-08,0.00418924,=,,,,not computed
+cpu,wide,TP,100,2595,343.545739,109624,,,20,100,,0.994073,0.00277879,0,0.000119944,0,0,7.10259e-06,0.00302084,0,=,,,,not computed
+cpu,wide,TP,100,2647,322.178226,67535.3,,,20,100,,0.998281,0.00015815,0,0,0,1.3091e-06,7.33124e-05,0.00145243,3.33849e-05,=,,,,not computed
+cpu,wide,TP,100,2651,267.748318,160619,,,20,100,,0.974778,0.000260218,0,0.024923,0,3.83931e-05,2.21031e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,2725,338.339694,295120,,,20,100,,0.999619,0.000302202,0,7.58029e-05,0,1.65254e-06,1.26649e-06,0,0,=,,,,not computed
+cpu,wide,TP,100,2760,210.545639,12794.2,,,20,100,,0.991798,5.84464e-05,0,0,1.72755e-05,0.00812597,7.57295e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,2770,267.870154,28369.1,,,20,100,,0.99611,0.00337771,0,0.000178103,0,0.000334529,3.79839e-08,0,0,=,,,,not computed
+cpu,wide,TP,100,2830,301.662959,46357.2,,,20,100,,0.981711,0.0103183,0,0.00474352,0,5.23063e-06,7.02487e-08,0.00322145,0,=,,,,not computed
+cpu,wide,TP,100,2851,297.212934,52841.8,,,20,100,,0.999995,0,0,0,0,4.7688e-06,5.00125e-08,0,5.4857e-07,=,,,,not computed
+cpu,wide,TP,100,2900,315.300972,18982.6,,,20,100,,0.991427,0.000500406,0,0.00017643,0,0,0.0078959,0,0,=,,,,not computed
+cpu,wide,TP,100,2923,348.829885,12003.7,,,20,100,,0.996327,0,0.0031833,0.000253331,0.000195173,0,0,4.12866e-05,0,=,,,,not computed
+cpu,wide,TP,100,2965,335.634093,12586.6,,,20,100,,0.997109,0,0.00282429,6.57128e-05,2.92155e-07,0,0,9.14484e-07,0,=,,,,not computed
+cpu,wide,TP,100,2983,316.345431,324297,,,20,100,,0.999267,0.000524978,0,0.000208059,0,0,1.29213e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,3039,332.762648,24761.1,,,20,100,,0.999796,3.49041e-05,0,0.000115275,0,0,5.36085e-05,4.63325e-08,0,=,,,,not computed
+cpu,wide,TP,100,3073,324.500289,57761.9,,,20,100,,0.998214,5.42762e-05,0,3.63351e-05,0,0,0.00169543,8.80208e-08,0,=,,,,not computed
+cpu,wide,TP,100,3097,242.764382,30841.9,,,20,100,,0.993851,1.40756e-08,0,0.000189922,0,1.49323e-07,0.00595845,3.0225e-08,0,=,,,,not computed
+cpu,wide,TP,100,3102,324.464752,11063.2,,,20,100,,0.986176,0.00248526,0,0,0,0.00353381,0.00780519,0,1.27339e-07,=,,,,not computed
+cpu,wide,TP,100,3166,302.677857,45582.7,,,20,100,,0.952892,0.0393989,0,0.00770817,0,0,1.02019e-06,0,0,=,,,,not computed
+cpu,wide,TP,100,3183,309.653496,661787,,,20,100,,0.991774,0.00810031,0,0,0,0,0.000126012,0,0,=,,,,not computed
+cpu,wide,TP,100,3207,244.248082,40391,,,20,100,,0.999983,5.36371e-07,0,0,0,1.62004e-05,5.95196e-08,0,0,=,,,,not computed
+cpu,wide,TP,100,3317,267.070696,29722.1,,,20,100,,0.999967,1.48155e-05,0,0,0,0,1.77102e-05,0,0,=,,,,not computed
+cpu,wide,TP,100,3398,275.042737,239623,,,20,100,,0.999681,0.000181446,0,2.21366e-05,0,0.000115472,2.48959e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,3446,322.162057,28483.3,,,20,100,,0.951997,0.00198887,0,0.0460145,0,0,1.17661e-08,0,0,=,,,,not computed
+cpu,wide,TP,100,3487,339.990234,791078,,,20,100,,0.999459,0.000541153,0,0,0,0,1.18e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,3514,224.285548,15197.3,,,20,100,,0.999623,8.30542e-05,0,0.000239289,0,5.50712e-05,1.28353e-08,0,0,=,,,,not computed
+cpu,wide,TP,100,3525,298.668743,147072,,,20,100,,0.992663,0.0070864,0,0.000235869,0,0,1.43937e-05,0,0,=,,,,not computed
+cpu,wide,TP,100,3589,100.971041,5.17594e+06,,,20,100,,0.987468,1.89611e-21,8.04359e-23,0.0123082,0.00014623,1.78924e-06,3.63469e-19,2.01657e-08,7.56933e-05,=,,,,not computed
+cpu,wide,TP,100,3630,297.961095,27761.3,,,20,100,,0.987387,0.0126131,0,0,0,0,0,0,2.39404e-08,=,,,,not computed
+cpu,wide,TP,100,3678,309.077435,701588,,,20,100,,0.985815,0.00193392,0,0.0114535,0,0.000797722,4.72018e-08,0,0,=,,,,not computed
+cpu,wide,TP,100,3694,341.388983,693962,,,20,100,,0.990682,1.4197e-07,0,0.00136331,0,4.50942e-07,0.000163322,0.00779095,0,=,,,,not computed
+cpu,wide,TP,100,3719,328.545347,12218.5,,,20,100,,0.990298,0,0,0.00957131,0,0,4.33724e-07,0.000130022,0,=,,,,not computed
+cpu,wide,TP,100,3743,318.910455,199295,,,20,100,,0.956382,0.0416787,0,0,0,0,0,0.00174774,0.000192019,=,,,,not computed
+cpu,wide,TP,100,3750,103.097374,420931,,,20,100,,0.906332,7.89988e-20,7.66781e-21,0.0436988,0.0411791,0,1.15314e-18,0.00822348,0.00056649,=,,,,not computed
+cpu,wide,TP,100,3751,328.896629,105979,,,20,100,,0.975836,0.023766,0,1.48785e-05,0,0,0.000383104,1.0987e-07,0,=,,,,not computed
+cpu,wide,TP,100,3824,304.468248,312984,,,20,100,,0.999275,0.000643836,0,5.47915e-05,0,5.89311e-08,2.55606e-05,6.26023e-07,0,=,,,,not computed
+cpu,wide,TP,100,3906,277.588505,20459.9,,,20,100,,0.990582,0.000310646,0,0.00907982,0,0,6.26808e-08,2.79165e-05,0,=,,,,not computed
+cpu,wide,TP,100,3917,343.581397,1.17697e+06,,,20,100,,0.996938,0.00183746,0,0,0,1.97466e-07,0.00122434,0,0,=,,,,not computed
+cpu,wide,TP,100,3920,343.671611,580817,,,20,100,,0.974276,6.27679e-05,0,0.0246274,0,0.000648993,8.47541e-06,0.000376215,0,=,,,,not computed
+cpu,wide,TP,100,4023,285.782864,91334.1,,,20,100,,0.987383,0.011805,0,0.000797876,0,0,1.36961e-05,0,0,=,,,,not computed
+cpu,wide,TP,100,4038,323.757098,11095.2,,,20,100,,0.996802,0,0,1.71924e-05,7.13117e-08,0.0031804,0,0,0,=,,,,not computed
+cpu,wide,TP,100,4046,285.149345,79201.3,,,20,100,,0.99919,0.000800401,0,0,0,9.83083e-08,9.64598e-07,8.73802e-06,0,=,,,,not computed
+cpu,wide,TP,100,4109,303.555139,21854.4,,,20,100,,0.999469,0.000376654,0,0,0,0,1.0305e-08,0.000154609,2.12281e-08,=,,,,not computed
+cpu,wide,TP,100,4117,285.997693,35626,,,20,100,,0.997197,0.000635589,0,0,0,0,1.45693e-05,1.32881e-05,0.00213957,=,,,,not computed
+cpu,wide,TP,100,4145,325.877321,848806,,,20,100,,0.997741,0.000730263,0,0.00152844,0,0,4.95168e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,4197,262.663801,28872.3,,,20,100,,0.976485,4.63761e-06,0,0.0235096,0,2.88537e-07,2.31948e-07,4.15475e-07,0,=,,,,not computed
+cpu,wide,TP,100,4212,315.979849,40307.3,,,20,100,,0.954251,0.0456239,0,0,0,0,2.38765e-05,0,0.000101054,=,,,,not computed
+cpu,wide,TP,100,4287,290.419926,16717,,,20,100,,0.997085,4.6871e-05,0,0,0,0.00114711,7.1675e-06,0.00110185,0.000611962,=,,,,not computed
+cpu,wide,TP,100,4319,264.942646,14080.3,,,20,100,,0.993902,0.00286068,0,0.00020205,0,0.00300153,1.11821e-08,3.40159e-05,0,=,,,,not computed
+cpu,wide,TP,100,4339,338.846237,16433.2,,,20,100,,0.992787,0.000114542,0,0,0,0,1.33788e-07,0,0.00709807,=,,,,not computed
+cpu,wide,TP,100,4358,336.607156,12678.1,,,20,100,,0.998641,0,0,0,0.00135928,0,0,0,0,=,,,,not computed
+cpu,wide,TP,100,4367,348.982593,1.294e+06,,,20,100,,0.999906,1.9544e-05,0,0,0,7.4475e-05,2.9438e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,4441,313.004390,24934.7,,,20,100,,0.957632,0.0417002,0,0.000642718,0,0,2.50448e-05,1.96603e-07,0,=,,,,not computed
+cpu,wide,TP,100,4462,327.960960,91796.1,,,20,100,,0.974384,0.0256157,0,0,0,0,5.58239e-07,0,0,=,,,,not computed
+cpu,wide,TP,100,4510,334.219218,11245.8,,,20,100,,0.986433,0.00508215,0,0.000187461,0,0,2.69497e-07,0.00829698,0,=,,,,not computed
+cpu,wide,TP,100,4563,347.266983,132954,,,20,100,,0.990467,0.00951889,0,0,0,0,1.87995e-08,1.35487e-05,7.61312e-07,=,,,,not computed
+cpu,wide,TP,100,4592,249.531913,14630.9,,,20,100,,0.996092,0.00350441,0,0.000403496,0,0,3.00259e-07,3.34782e-08,0,=,,,,not computed
+cpu,wide,TP,100,4653,343.869118,49696.8,,,20,100,,0.998857,5.48661e-05,0,2.08349e-05,0,0.000556228,0.000510959,1.33048e-07,0,=,,,,not computed
+cpu,wide,TP,100,4762,298.014373,188888,,,20,100,,0.983062,0.00389304,0,0.00509541,0,1.69963e-06,0.00794715,1.0363e-06,0,=,,,,not computed
+cpu,wide,TP,100,4835,338.105172,51745.3,,,20,100,,0.994614,0.000572221,0,0.00202118,0,0.00279116,9.18624e-07,5.9961e-07,0,=,,,,not computed
+cpu,wide,TP,100,4868,282.856930,29346.8,,,20,100,,0.996416,0.000364344,0,0.00321867,0,0,9.62648e-08,1.22646e-06,0,=,,,,not computed
+cpu,wide,TP,100,4886,335.749256,15888.8,,,20,100,,0.989945,0.00756502,0,0,0,2.67188e-07,2.37901e-07,0.00237288,0.000116393,=,,,,not computed
+cpu,wide,TP,100,4966,300.916709,79955.8,,,20,100,,0.969756,3.69327e-05,0,0.027882,0,0,0.00232431,5.70697e-07,0,=,,,,not computed
+cpu,wide,TP,100,4995,295.743428,88160.5,,,20,100,,0.986312,9.13896e-05,0,0.0135803,0,0,2.8292e-08,1.61191e-05,0,=,,,,not computed
+cpu,wide,TP,100,5000,104.186172,1.94675e+06,,,20,100,,0.952024,3.34303e-20,3.00734e-32,0.0374229,3.10155e-06,0.00333276,0,0,0.00721715,=,,,,not computed
+cpu,wide,UVkkt,100,2447,100.112503,443593,1.17379,-2.21573e+06,20,100,101.264496,531.314,1.39394e-17,4.56208e-18,1.35723,0.248023,0,1.44534e-17,0.041925,0.000233883,=,,,,not computed
+cpu,wide,UVkkt,100,2645,100.746556,2.94378e+06,7.74325,-1.52343e+07,20,100,101.207386,3511.3,1.34718e-17,3.2041e-18,2.53908,0.088712,11.6994,8.97535e-18,0.425796,0.388729,=,,,,not computed
+cpu,wide,UVkkt,100,3589,100.971041,5.17594e+06,15.4859,-2.55136e+07,20,100,101.677806,6087.82,1.78233e-17,8.14879e-19,75.8808,0.901522,0.0110308,5.75092e-18,0.000124323,0.466656,=,,,,not computed
+cpu,cold,TP,100,15,101.174559,1.43367e+06,,,20,100,,0.993884,7.74701e-21,1.8441e-32,0.0056043,1.37673e-05,0,0,8.69276e-08,0.000497433,=,,,,not computed
+cpu,cold,TP,100,18,105.124473,8.11149e+06,,,20,100,,0.982744,1.35968e-20,2.31759e-21,0.00116473,0.0158324,2.61037e-07,4.93406e-20,0,0.000259052,=,,,,not computed
+cpu,cold,TP,100,28,108.127055,1.0517e+06,,,20,100,,0.952734,5.48822e-19,5.83088e-20,0.042613,0.00176884,0,1.27162e-18,2.00886e-07,0.00288396,=,,,,not computed
+cpu,cold,TP,100,54,107.418325,9.51111e+06,,,20,100,,0.98337,4.13822e-20,1.33643e-31,0.00873824,0.000372428,0.00423646,0,1.71706e-07,0.00328235,20,100,,0.98337|4.13822e-20|1.33643e-31|0.00873824|0.000372428|0.00423646|0|1.71706e-07|0.00328235,not computed
+cpu,cold,TP,100,64,103.046841,194861,,,20,100,,0.980423,1.72799e-19,5.11495e-20,0.0104726,0.00885757,0,2.20037e-19,0,0.000246423,=,,,,not computed
+cpu,cold,TP,100,73,105.373632,2.83145e+06,,,20,100,,0.99578,4.54175e-20,1.15147e-20,0.00160899,0.00260848,1.66873e-06,2.71876e-20,0,3.70983e-07,=,,,,not computed
+cpu,cold,TP,100,84,108.123266,5.8847e+06,,,20,100,,0.965769,9.78653e-20,2.01768e-31,0.0293591,0.00233741,3.23497e-06,0,0,0.00253082,20,100,,0.965769|9.78653e-20|2.01768e-31|0.0293591|0.00233741|3.23497e-06|0|0|0.00253082,not computed
+cpu,cold,TP,100,91,105.540042,1.85929e+06,,,2,1,,0.9935,0.00385011,0,0.00258611,1.82408e-07,4.14775e-05,2.20963e-05,1.3405e-07,1.89451e-07,20,100,,0.993522|7.58147e-20|1.90994e-20|0.00256407|0.00385037|4.14784e-05|6.89537e-20|1.34053e-07|2.22862e-05,ref 101 T=105.540042; dev not computed (not converged)
+cpu,cold,TP,100,130,106.349810,2.20256e+06,,,20,100,,0.992029,1.00006e-19,3.24608e-20,0.00153203,0.00418207,0.00211207,1.70368e-20,0,0.000144501,=,,,,not computed
+cpu,cold,TP,100,135,101.313122,3.72155e+06,,,20,100,,0.994687,3.23106e-21,2.14103e-21,7.53182e-05,0.00522623,0,1.21007e-21,0,1.11413e-05,=,,,,not computed
+cpu,cold,TP,100,137,103.386023,748969,,,20,100,,0.997641,5.52718e-20,2.20798e-20,0.00162181,0.000549613,0.00018766,1.84766e-20,0,1.69658e-07,=,,,,not computed
+cpu,cold,TP,100,165,100.440548,3.70314e+06,,,20,100,,0.978779,1.90243e-21,8.08755e-23,0.0151208,0.00591481,0,4.3895e-19,0,0.000185257,=,,,,not computed
+cpu,cold,TP,100,185,101.373502,4.83939e+06,,,20,100,,0.997735,2.59079e-21,2.79623e-22,0.0022242,3.28874e-05,1.54676e-06,7.78721e-20,0,6.62907e-06,=,,,,not computed
+cpu,cold,TP,100,219,107.588708,844727,,,20,100,,0.989839,5.14553e-19,1.21173e-19,0.00976337,0.000339326,0,2.29087e-19,0,5.83554e-05,=,,,,not computed
+cpu,cold,TP,100,245,104.398585,1.28634e+06,,,20,100,,0.97877,5.71687e-20,7.30285e-21,0.0113234,0.009245,0.00038809,2.34464e-19,0.000228603,4.48699e-05,=,,,,not computed
+cpu,cold,TP,100,297,100.742165,252528,,,20,100,,0.94075,3.2619e-20,4.24923e-21,0.0245421,0.0346934,0,7.47915e-19,0,1.40638e-05,=,,,,not computed
+cpu,cold,TP,100,324,104.751600,3.12896e+06,,,20,100,,0.977525,2.84045e-20,7.05095e-21,0.00131146,0.0199201,1.67979e-06,2.77953e-20,0,0.00124187,=,,,,not computed
+cpu,cold,TP,100,328,101.327258,2.85643e+06,,,20,100,,0.989644,4.26801e-21,2.77146e-22,0.0103041,5.15565e-05,0,3.77666e-19,0,7.55413e-08,=,,,,not computed
+cpu,cold,TP,100,420,107.304038,967419,,,20,100,,0.945053,3.7352e-19,5.04552e-20,0.0237444,0.0311989,6.26585e-08,5.68073e-19,3.72149e-06,1.62158e-08,=,,,,not computed
+cpu,cold,TP,100,448,101.032606,3.57862e+06,,,20,100,,0.985938,2.81662e-21,4.61871e-33,0.00302452,0.00936892,0.000459389,0,0,0.00120916,20,100,,0.985938|2.81662e-21|4.61871e-33|0.00302452|0.00936892|0.000459389|0|0|0.00120916,not computed
+cpu,cold,TP,100,459,101.849840,5.12884e+06,,,20,100,,0.968951,3.16705e-21,2.88953e-22,0.00317069,0.0278378,0,6.3167e-20,9.0602e-08,4.07328e-05,=,,,,not computed
+cpu,cold,TP,100,488,101.961590,832631,,,20,100,,0.956901,2.12375e-20,1.52674e-21,0.0328214,0.00670393,0.00342213,9.70385e-19,0.00015003,1.45408e-06,=,,,,not computed
+cpu,cold,TP,100,491,107.991831,429613,,,20,100,,0.957152,1.24955e-18,2.17833e-19,0.0377224,0.000659357,0.00443909,1.03974e-18,2.7655e-05,1.66744e-08,=,,,,not computed
+cpu,cold,TP,100,501,105.303365,5.59599e+06,,,20,100,,0.97737,2.16531e-20,1.12707e-20,0.000186603,0.0224026,0,7.85702e-22,2.02623e-08,4.08125e-05,=,,,,not computed
+cpu,cold,TP,100,522,108.256132,265492,,,20,100,,0.952971,2.30664e-18,5.58128e-19,0.0330573,0.0139361,2.47467e-06,1.31488e-18,0,3.26483e-05,=,,,,not computed
+cpu,cold,TP,100,528,101.494884,68552.8,,,20,100,,0.973738,1.92249e-19,1.51579e-19,0.0029518,0.0232882,0,2.94507e-20,1.45688e-05,7.8653e-06,=,,,,not computed
+cpu,cold,TP,100,534,100.390993,2.95562e+06,,,20,100,,0.992145,2.32003e-21,1.85622e-22,0.00530808,0.00209706,0,2.00917e-19,0,0.000450165,=,,,,not computed
+cpu,cold,TP,100,557,100.427555,3.85237e+06,,,20,100,,0.989594,1.82516e-21,9.21126e-23,0.0103456,6.00666e-05,4.20392e-07,4.52015e-19,0,3.4578e-07,=,,,,not computed
+cpu,cold,TP,100,584,107.409397,380083,,,20,100,,0.977219,1.02331e-18,3.89338e-19,0.00790895,0.0147945,0,1.64759e-19,7.75511e-05,3.75812e-08,=,,,,not computed
+cpu,cold,TP,100,592,106.810175,6.51297e+06,,,20,100,,0.993196,4.36407e-20,6.03832e-21,0.00313482,0.003654,0,6.83909e-20,0,1.48076e-05,=,,,,not computed
+cpu,cold,TP,100,607,103.556910,158932,,,20,100,,0.947769,2.84641e-19,4.97479e-20,0.0409666,0.0100906,0,1.6871e-18,1.27628e-05,0.0011607,=,,,,not computed
+cpu,cold,TP,100,642,100.757488,39047,,,20,100,,0.941231,2.1176e-19,8.0337e-20,0.0186736,0.0308961,2.16146e-06,7.58831e-19,0.00511006,0.00408715,=,,,,not computed
+cpu,cold,TP,100,678,106.325499,3.83812e+06,,,20,100,,0.990631,5.67323e-20,7.88831e-21,0.00477666,0.00262792,0,1.09467e-19,1.00173e-08,0.00196444,=,,,,not computed
+cpu,cold,TP,100,682,108.463898,1.73261e+06,,,20,100,,0.94455,3.95751e-19,3.30482e-20,0.0444025,0.00977268,0,1.11668e-18,0,0.00127494,0,78,,0.94455|3.95752e-19|2.08203e-30|0.0444025|0.00977268|0|0|0|0.00127494,ref 101 T=108.463898; head dev abs=6.9e-18 rel=3.0e-12
+cpu,cold,TP,100,701,102.158559,7.59518e+06,,,20,100,,0.957357,2.53383e-21,8.05348e-22,0.000185905,0.0424566,0,3.33101e-21,4.03378e-07,6.00045e-08,=,,,,not computed
+cpu,cold,TP,100,739,102.465342,8.78936e+06,,,20,100,,0.986065,2.73326e-21,1.16466e-22,0.00993731,0.00332283,0,3.65464e-19,1.45163e-06,0.000673555,=,,,,not computed
+cpu,cold,TP,100,787,109.136455,1.15982e+06,,,20,100,,0.993175,8.5083e-19,2.46265e-19,0.00634851,0.000424328,0,6.31386e-20,2.47291e-06,4.92794e-05,=,,,,not computed
+cpu,cold,TP,100,795,103.533733,25262,,,20,100,,0.956359,1.77878e-18,7.99365e-19,0.0390545,0.00446345,0,5.73998e-19,0,0.00012345,=,,,,not computed
+cpu,cold,TP,100,848,106.880338,222929,,,20,100,,0.980919,1.3239e-18,4.58295e-19,0.0148287,0.00366468,0,9.09126e-20,0,0.000587991,=,,,,not computed
+cpu,cold,TP,100,853,104.906674,2.26785e+06,,,20,100,,0.989537,4.35683e-20,5.56803e-21,0.00717767,0.00316939,0,1.7632e-19,5.18804e-07,0.00011523,=,,,,not computed
+cpu,cold,TP,100,875,102.887649,27048.7,,,20,100,,0.962638,1.1208e-18,6.85181e-19,0.0168986,0.0204632,0,2.37935e-19,0,1.03108e-08,=,,,,not computed
+cpu,cold,TP,100,885,102.211197,5.06777e+06,,,20,100,,0.998141,4.09063e-21,5.85282e-22,0.00145182,0.000399786,8.65027e-08,4.25467e-20,0,7.14561e-06,=,,,,not computed
+cpu,cold,TP,100,903,101.430311,2.88479e+06,,,20,100,,0.987993,4.49441e-21,2.82774e-22,0.0111091,0.000488459,7.72251e-07,3.71844e-19,1.31476e-05,0.00039586,=,,,,not computed
+cpu,cold,TP,100,916,109.278676,5.4393e+06,,,20,100,,0.939009,1.8467e-19,2.57479e-20,0.00566492,0.0380722,0.00502625,1.51931e-19,0,0.0122277,20,100,,0.939009|1.8467e-19|2.57479e-20|0.00566492|0.0380722|0.00502625|1.51931e-19|0|0.0122277,not computed
+cpu,cold,TP,100,924,109.226157,2.2203e+06,,,20,100,,0.952213,4.54896e-19,4.87628e-20,0.0240213,0.0168994,0,4.22176e-19,0.00155156,0.00531483,=,,,,not computed
+cpu,cold,TP,100,965,100.428833,1.37332e+06,,,20,100,,0.957627,5.12116e-21,2.15369e-22,0.041784,3.15871e-05,3.09048e-07,1.3681e-18,0.000528827,2.78616e-05,=,,,,not computed
+cpu,cold,TP,100,1031,104.271705,1.0348e+06,,,20,100,,0.959596,6.67521e-20,4.99351e-21,0.0403711,3.28425e-05,0,1.56885e-18,0,3.14234e-07,=,,,,not computed
+cpu,cold,TP,100,1095,109.623721,8.80271e+06,,,20,100,,0.952779,1.43897e-19,6.06641e-21,0.0430883,0.00410404,0,1.52268e-18,0,2.87252e-05,=,,,,not computed
+cpu,cold,TP,100,1135,103.479087,3.39929e+06,,,20,100,,0.950434,1.22635e-20,1.72495e-21,0.00280436,0.0467615,0,8.39821e-20,4.70783e-08,2.48788e-07,=,,,,not computed
+cpu,cold,TP,100,1152,106.029175,256361,,,20,100,,0.983926,7.1654e-19,3.63925e-19,0.00501652,0.00161682,0,3.19563e-20,0.00812042,0.00132058,=,,,,not computed
+cpu,cold,TP,100,1179,108.772277,2.58052e+06,,,20,100,,0.978874,3.11028e-19,6.51098e-20,0.0050083,0.00915338,2.03593e-08,8.49048e-20,0.0069638,1.76051e-07,=,,,,not computed
+cpu,cold,TP,100,1232,104.688378,33401.4,,,20,100,,0.972854,2.59667e-18,1.71834e-18,0.0172591,0.00980802,0,4.53657e-21,0,7.90376e-05,=,,,,not computed
+cpu,cold,TP,100,1238,103.366037,1.66909e+06,,,20,100,,0.975551,2.39435e-20,1.25226e-20,0.00041291,0.0207794,0,3.95408e-21,0.00309767,0.000158964,20,100,,0.975551|2.39435e-20|1.25226e-20|0.00041291|0.0207794|0|3.95408e-21|0.00309767|0.000158964,not computed
+cpu,cold,TP,100,1274,101.724902,139411,,,20,100,,0.989091,1.10613e-19,4.54408e-20,0.00572881,0.00215385,0,1.45424e-19,2.44276e-08,0.00302641,20,100,,0.989091|1.10613e-19|4.54408e-20|0.00572881|0.00215385|0|1.45424e-19|2.44276e-08|0.00302641,not computed
+cpu,cold,TP,100,1280,100.114341,862117,,,20,100,,0.989051,6.69588e-21,8.03481e-22,0.00759325,0.000162492,0,1.51432e-19,0.00302066,0.000173001,=,,,,not computed
+cpu,cold,TP,100,1376,100.826474,230466,,,20,100,,0.958268,3.87583e-20,4.48354e-21,0.035787,0.00545468,0.000393149,1.13819e-18,0,9.69068e-05,=,,,,not computed
+cpu,cold,TP,100,1385,100.960364,897621,,,20,100,,0.963219,1.04819e-20,2.97096e-21,0.00153048,0.0337997,0,3.81512e-20,2.81989e-07,0.00145011,=,,,,not computed
+cpu,cold,TP,100,1401,103.895489,102428,,,2,1,,0.945447,0.0306713,0,0.0238416,2.68945e-05,1.42216e-07,5.25927e-07,1.24847e-05,2.75057e-08,20,100,,0.945448|5.26643e-19|1.54224e-19|0.0238411|0.0306982|1.42216e-07|6.11265e-19|1.24847e-05|5.53433e-07,ref 101 T=103.895489; dev not computed (not converged)
+cpu,cold,TP,100,1447,103.665026,64314.7,,,20,100,,0.952343,7.45579e-19,2.33838e-19,0.0320224,0.0156108,0,9.74975e-19,0,2.41065e-05,=,,,,not computed
+cpu,cold,TP,100,1538,100.984246,100142,,,20,100,,0.985305,9.84942e-20,3.11779e-20,0.011424,0.00325977,0,2.52491e-19,0,1.16092e-05,=,,,,not computed
+cpu,cold,TP,100,1566,102.949335,489239,,,20,100,,0.99775,6.55586e-20,3.03049e-20,0.00168947,0.000560529,0,2.00325e-20,0,2.70472e-08,=,,,,not computed
+cpu,cold,TP,100,1624,105.694348,4.32712e+06,,,20,100,,0.958495,3.46315e-20,2.5386e-21,0.0130978,0.0187617,0.000324628,2.92245e-19,0,0.00932082,=,,,,not computed
+cpu,cold,TP,100,1652,101.322708,2.19236e+06,,,20,100,,0.949087,5.51543e-21,3.91681e-35,0.0454431,0.00355246,2.68954e-06,0,0,0.00191523,=,,,,not computed
+cpu,cold,TP,100,1679,100.362055,27418.7,,,20,100,,0.988147,2.46266e-19,1.37062e-19,0.0117767,6.14742e-05,0,1.97794e-19,0,1.52307e-05,=,,,,not computed
+cpu,cold,TP,100,1681,101.428130,5.15525e+06,,,20,100,,0.972192,2.5008e-21,8.23476e-23,0.0225861,0.00130734,0.00380771,5.04629e-19,0,0.000106928,=,,,,not computed
+cpu,cold,TP,100,1709,103.492408,8.58577e+06,,,20,100,,0.993798,5.12317e-21,7.41896e-33,0.00426122,2.97691e-05,1.43072e-08,0,1.38353e-05,0.00189688,=,,,,not computed
+cpu,cold,TP,100,1723,103.909697,9.48275e+06,,,20,100,,0.993558,5.91097e-21,7.18779e-33,0.00541929,2.21185e-05,4.61955e-05,0,0,0.000954715,=,,,,not computed
+cpu,cold,TP,100,1732,101.736646,1.19175e+06,,,20,100,,0.999413,1.30948e-20,8.63982e-21,0.000261747,0.00019275,5.70323e-07,3.00706e-21,6.58164e-08,0.000131424,=,,,,not computed
+cpu,cold,TP,100,1739,101.440292,5.25391e+06,,,20,100,,0.964147,2.48276e-21,6.53065e-23,0.0349758,0.000864022,0,1.09049e-18,0,1.31982e-05,=,,,,not computed
+cpu,cold,TP,100,1741,100.898622,2.0257e+06,,,20,100,,0.986876,4.59642e-21,5.06227e-22,0.00455271,0.000151392,0,1.55614e-19,1.5695e-08,0.0084199,=,,,,not computed
+cpu,cold,TP,100,1809,100.749828,1.83793e+06,,,20,100,,0.996871,4.65919e-21,8.18155e-22,0.00192347,0.000494489,0,3.31417e-20,0.000710029,7.40699e-07,=,,,,not computed
+cpu,cold,TP,100,1815,100.334865,191367,,,20,100,,0.989914,3.45776e-20,9.69439e-21,0.006586,0.00217049,0,1.68431e-19,4.22552e-07,0.00132956,=,,,,not computed
+cpu,cold,TP,100,1820,104.641130,231584,,,20,100,,0.985968,3.6693e-19,1.18196e-19,0.0104697,0.00355519,9.89604e-09,2.4352e-19,0,6.68126e-06,=,,,,not computed
+cpu,cold,TP,100,1840,105.321389,733324,,,20,100,,0.992523,1.70606e-19,4.16067e-20,0.00665458,0.000664365,0.000158423,1.19287e-19,0,1.45388e-08,=,,,,not computed
+cpu,cold,TP,100,1875,106.573378,457109,,,20,100,,0.961886,5.34754e-19,1.30704e-19,0.0133643,0.0247161,0,3.29153e-19,0,3.3523e-05,=,,,,not computed
+cpu,cold,TP,100,1926,101.151785,2.59291e+06,,,20,100,,0.964061,4.17796e-21,1.80418e-22,0.0244042,0.0115342,0,7.29878e-19,0,5.58353e-07,=,,,,not computed
+cpu,cold,TP,100,1998,104.838141,114938,,,20,100,,0.930925,7.94446e-19,2.27939e-19,0.0266148,0.0396387,0,7.13761e-19,0,0.00282189,=,,,,not computed
+cpu,cold,TP,100,2030,105.410324,127238,,,20,100,,0.978964,1.02754e-18,4.11073e-19,0.0144306,0.00587072,0,1.2612e-19,3.64446e-06,0.000730933,=,,,,not computed
+cpu,cold,TP,100,2134,107.670342,3.0586e+06,,,20,100,,0.968561,1.44154e-19,3.98542e-20,0.00193004,0.02892,0,2.86864e-20,0.00058921,9.82787e-09,=,,,,not computed
+cpu,cold,TP,100,2145,102.247559,6.56204e+06,,,20,100,,0.994973,3.22016e-21,5.39234e-33,0.00210058,0.00158393,0,0,3.09947e-05,0.00131141,20,100,,0.994973|3.22016e-21|5.39234e-33|0.00210058|0.00158393|0|0|3.09947e-05|0.00131141,not computed
+cpu,cold,TP,100,2153,100.985501,4.22491e+06,,,20,100,,0.997386,2.34077e-21,8.00271e-33,0.00121479,0.000912656,0,0,0.000307167,0.000179154,=,,,,not computed
+cpu,cold,TP,100,2158,102.958684,62388.5,,,20,100,,0.979747,5.13157e-19,2.44519e-19,0.0124022,0.00782122,0,2.2495e-19,4.04088e-08,2.95047e-05,=,,,,not computed
+cpu,cold,TP,100,2192,103.616769,139175,,,20,100,,0.985222,3.40167e-19,1.09201e-19,0.0141951,0.000564746,0,3.26197e-19,1.00108e-05,8.40725e-06,=,,,,not computed
+cpu,cold,TP,100,2203,102.875945,6.0189e+06,,,20,100,,0.989492,5.06626e-21,5.34556e-22,0.00257547,0.00465077,1.00806e-06,6.7426e-20,0.00225616,0.00102439,=,,,,not computed
+cpu,cold,TP,100,2204,101.309351,7.35904e+06,,,20,100,,0.996573,1.63539e-21,1.83651e-22,0.00132931,0.000506237,0,4.784e-20,0.00116269,0.00042838,20,100,,0.996573|1.63539e-21|1.83651e-22|0.00132931|0.000506237|0|4.784e-20|0.00116269|0.00042838,not computed
+cpu,cold,TP,100,2214,100.649176,2.71307e+06,,,20,100,,0.994576,2.9592e-21,4.73409e-22,0.00153076,0.000786254,0.00308966,3.33642e-20,4.43138e-08,1.72233e-05,=,,,,not computed
+cpu,cold,TP,100,2218,103.032642,1.72032e+06,,,20,100,,0.964079,1.94851e-20,1.58995e-32,0.0306121,1.46558e-05,0,0,3.04833e-07,0.00529431,=,,,,not computed
+cpu,cold,TP,100,2266,103.582629,2.43831e+06,,,20,100,,0.977554,1.86222e-20,1.33661e-20,0.000157418,0.0222881,0,6.94967e-23,6.05922e-08,2.12578e-07,=,,,,not computed
+cpu,cold,TP,100,2269,106.467641,681427,,,20,100,,0.951407,3.38991e-19,4.89103e-20,0.0252244,0.0229027,0,4.65013e-19,0.000205155,0.00026065,=,,,,not computed
+cpu,cold,TP,100,2283,101.032293,295324,,,20,100,,0.964495,3.44823e-20,3.66375e-21,0.0348446,9.49733e-05,0.000114048,1.50322e-18,1.31128e-08,0.000451056,=,,,,not computed
+cpu,cold,TP,100,2300,101.462309,7.50704e+06,,,20,100,,0.986171,1.75342e-21,7.73295e-23,0.008713,1.99065e-05,0,2.83344e-19,0.00509519,8.3089e-07,=,,,,not computed
+cpu,cold,TP,100,2321,100.863455,155883,,,20,100,,0.960165,5.67361e-20,3.30387e-20,0.00203782,0.0335723,2.02631e-08,9.6499e-20,0.00422513,2.27803e-08,=,,,,not computed
+cpu,cold,TP,100,2366,100.799083,5.0864e+06,,,20,100,,0.968476,1.72541e-21,5.09565e-23,0.0247046,0.00225766,0,4.59424e-19,0.000146937,0.00441439,20,100,,0.968476|1.72541e-21|5.09565e-23|0.0247046|0.00225766|0|4.59432e-19|0.000146937|0.00441439,not computed
+cpu,cold,TP,100,2378,102.131699,736614,,,20,100,,0.965491,2.62492e-20,3.3454e-21,0.0121003,0.0186535,0.00375501,3.73773e-19,0,2.87234e-07,=,,,,not computed
+cpu,cold,TP,100,2383,108.686598,1.98497e+06,,,20,100,,0.969965,3.86607e-19,5.44797e-20,0.0141372,0.00848414,1.26402e-07,3.08783e-19,1.62415e-05,0.0073978,=,,,,not computed
+cpu,cold,TP,100,2399,109.081420,3.22862e+06,,,20,100,,0.987826,2.95333e-19,5.16434e-20,0.00614873,0.00318263,3.62243e-07,1.62284e-19,0.00283364,8.14587e-06,=,,,,not computed
+cpu,cold,TP,100,2490,103.355091,231658,,,20,100,,0.990953,1.75519e-19,5.53155e-20,0.00836991,0.00041983,3.99264e-06,2.12715e-19,0.000104425,0.000148427,=,,,,not computed
+cpu,cold,TP,100,2499,100.640047,2.56263e+06,,,20,100,,0.964901,3.03001e-21,3.07587e-22,0.00390662,0.0311908,0,1.71107e-19,1.06233e-06,1.31003e-07,=,,,,not computed
+cpu,cold,TP,100,2516,109.151628,9.627e+06,,,20,100,,0.988859,1.03319e-19,8.02268e-21,0.0106579,0.000333382,0,2.71169e-19,2.62086e-07,0.000149444,=,,,,not computed
+cpu,cold,TP,100,2553,102.592912,9.21374e+06,,,20,100,,0.97348,2.78385e-21,1.03893e-22,0.0125766,0.0138242,0.000107763,2.58495e-19,0,1.11959e-05,=,,,,not computed
+cpu,cold,TP,100,2573,102.237201,6.91401e+06,,,20,100,,0.994335,3.0424e-21,3.09274e-33,0.00436586,0.000790915,5.73479e-07,0,0.000131757,0.000375641,=,,,,not computed
+cpu,cold,TP,100,2622,107.509467,3.03859e+06,,,20,100,,0.991409,1.36999e-19,1.90986e-20,0.00762115,0.000969085,9.10612e-07,1.13832e-19,0,1.84835e-07,=,,,,not computed
+cpu,cold,TP,100,2640,101.792353,640042,,,20,100,,0.954252,2.48384e-20,2.06564e-21,0.0305933,0.0151536,0,1.68866e-18,1.02244e-06,3.37855e-07,=,,,,not computed
+cpu,cold,TP,100,2646,101.113456,3.06613e+06,,,20,100,,0.980368,3.48893e-21,1.58169e-22,0.0187669,0.000864718,0,4.87028e-19,0,7.29319e-07,=,,,,not computed
+cpu,cold,TP,100,2649,102.940876,3.01892e+06,,,20,100,,0.99443,1.05398e-20,1.79931e-21,0.00199774,0.00137764,1.22022e-06,6.32207e-20,5.02677e-08,0.00219291,20,100,,0.99443|1.05398e-20|1.79931e-21|0.00199774|0.00137764|1.22022e-06|6.32207e-20|5.02677e-08|0.00219291,not computed
+cpu,cold,TP,100,2652,109.058776,720569,,,20,100,,0.985687,1.31451e-18,3.29032e-19,0.0134574,0.000854719,7.53046e-07,2.63639e-19,0,1.22375e-08,=,,,,not computed
+cpu,cold,TP,100,2680,100.860818,2.27953e+06,,,20,100,,0.956324,4.01784e-21,1.94888e-33,0.0417132,0.000339861,0,0,0,0.00162298,=,,,,not computed
+cpu,cold,TP,100,2691,102.760291,1.91712e+06,,,20,100,,0.967839,1.46064e-20,3.63846e-32,0.00736989,0.000914074,0,0,1.17738e-06,0.0238759,=,,,,not computed
+cpu,cold,TP,100,2697,103.325290,6.27021e+06,,,20,100,,0.990492,6.34587e-21,5.17259e-22,0.00457396,0.000446244,0.000584971,1.22958e-19,0.00388004,2.29405e-05,=,,,,not computed
+cpu,cold,TP,100,2730,101.514879,110111,,,20,100,,0.989479,1.23322e-19,6.10837e-20,0.00476118,0.00575937,0,1.31969e-19,1.6567e-08,2.43663e-07,=,,,,not computed
+cpu,cold,TP,100,2751,105.920986,573814,,,20,100,,0.984923,3.026e-19,8.25843e-20,0.00762162,0.00745541,0,1.85022e-19,3.40599e-08,1.2178e-08,=,,,,not computed
+cpu,cold,TP,100,2768,109.216870,1.42037e+06,,,20,100,,0.991755,7.24707e-19,1.7011e-19,0.00800574,0.000156428,5.62145e-07,2.09921e-19,0,8.18995e-05,=,,,,not computed
+cpu,cold,TP,100,2821,106.485500,5.71352e+06,,,2,1,,0.970959,0.0272374,0,0.00180386,0,1.27015e-08,1.38524e-08,0,9.17153e-08,20,100,,0.970959|4.06664e-20|7.57584e-21|0.00180385|0.0272374|1.27015e-08|3.68595e-20|0|1.05568e-07,ref 101 T=106.485500; dev not computed (not converged)
+cpu,cold,TP,100,2836,102.219034,93755.8,,,20,100,,0.98191,2.18742e-19,1.78923e-19,0.00236837,0.00656909,0,1.05805e-20,0.00913334,1.90973e-05,=,,,,not computed
+cpu,cold,TP,100,2897,101.326947,97540.4,,,20,100,,0.960593,1.24771e-19,2.28672e-20,0.0378196,0.00152236,0,1.43659e-18,0,6.48956e-05,=,,,,not computed
+cpu,cold,TP,100,2899,100.667070,398745,,,20,100,,0.970593,1.98699e-20,7.84561e-21,0.00167556,0.0276032,0,4.66137e-20,1.28413e-05,0.000115182,20,100,,0.970593|1.98699e-20|7.84561e-21|0.00167556|0.0276032|0|4.66136e-20|1.28413e-05|0.000115182,not computed
+cpu,cold,TP,100,2918,100.932787,3.49728e+06,,,20,100,,0.986804,2.70879e-21,4.68495e-22,0.00107364,0.0120472,3.25959e-06,3.22152e-20,0,7.18283e-05,=,,,,not computed
+cpu,cold,TP,100,2956,106.714238,361645,,,20,100,,0.944154,7.3723e-19,1.18344e-19,0.040675,0.0135315,1.25067e-05,1.3862e-18,0,0.00162687,20,100,,0.944154|7.3723e-19|1.18344e-19|0.040675|0.0135315|1.25067e-05|1.3862e-18|0|0.00162687,not computed
+cpu,cold,TP,100,3017,100.513108,6.47465e+06,,,20,100,,0.995588,1.14374e-21,7.18436e-34,0.00343696,0.000594557,0,0,8.60629e-06,0.000372123,20,100,,0.995588|1.14374e-21|7.18436e-34|0.00343696|0.000594557|0|0|8.60629e-06|0.000372123,not computed
+cpu,cold,TP,100,3051,102.604934,4.61653e+06,,,20,100,,0.985253,5.59204e-21,2.60341e-21,0.000161609,0.0145412,0,3.55855e-21,0,4.39734e-05,20,100,,0.985253|5.59204e-21|2.60341e-21|0.000161609|0.0145412|0|3.55855e-21|0|4.39734e-05,not computed
+cpu,cold,TP,100,3088,101.403151,296841,,,20,100,,0.942678,4.1263e-20,6.42498e-21,0.0168272,0.040038,0,7.05703e-19,0,0.000456881,=,,,,not computed
+cpu,cold,TP,100,3095,107.050935,5.11444e+06,,,20,100,,0.973034,6.35153e-20,3.54162e-21,0.0258506,0.000239635,0,7.52419e-19,0.000556825,0.000319442,=,,,,not computed
+cpu,cold,TP,100,3122,102.367947,2.39066e+06,,,20,100,,0.986321,9.50482e-21,7.0596e-22,0.0117987,0.00153974,0,4.39919e-19,0,0.000340664,=,,,,not computed
+cpu,cold,TP,100,3173,103.632565,1.2788e+06,,,20,100,,0.99388,3.73749e-20,6.15693e-21,0.00588843,0.000231561,0,2.12148e-19,0,8.42062e-08,=,,,,not computed
+cpu,cold,TP,100,3192,101.599778,3.93574e+06,,,20,100,,0.951597,3.48407e-21,4.1432e-22,0.00225895,0.0461134,3.02914e-05,1.01885e-19,0,1.52865e-07,=,,,,not computed
+cpu,cold,TP,100,3201,100.098742,1.29679e+06,,,20,100,,0.967143,4.40071e-21,1.12797e-33,0.0277231,0.00016998,0,0,6.418e-06,0.00495742,=,,,,not computed
+cpu,cold,TP,100,3229,104.963768,2.20541e+06,,,20,100,,0.968396,4.52632e-20,6.07939e-21,0.00661443,0.0248012,3.36922e-05,1.88769e-19,0,0.000154804,=,,,,not computed
+cpu,cold,TP,100,3283,101.699449,486544,,,20,100,,0.9745,3.0767e-20,2.43418e-31,0.00612184,0.0118572,3.83202e-07,0,0.00106008,0.00646068,=,,,,not computed
+cpu,cold,TP,100,3301,101.209969,1.79448e+06,,,20,100,,0.997925,6.31651e-21,2.66206e-21,0.000378767,0.00125561,0,1.1275e-20,0,0.000440759,20,100,,0.997925|6.31651e-21|2.66206e-21|0.000378767|0.00125561|0|1.1275e-20|0|0.000440759,not computed
+cpu,cold,TP,100,3302,101.251694,3.22871e+06,,,20,100,,0.991028,3.59459e-21,3.94901e-33,0.00556596,7.07961e-05,0,0,0.00316854,0.000166683,=,,,,not computed
+cpu,cold,TP,100,3318,102.802774,5.18938e+06,,,20,100,,0.99294,5.64562e-21,6.96965e-22,0.0021546,0.00201213,1.20097e-05,8.84043e-20,0.00210734,0.000774397,=,,,,not computed
+cpu,cold,TP,100,3382,100.775604,4.29682e+06,,,20,100,,0.990785,2.02426e-21,1.15743e-22,0.00780319,0.000331108,0,4.08049e-19,0.000672227,0.000408325,=,,,,not computed
+cpu,cold,TP,100,3392,105.949216,2.61338e+06,,,20,100,,0.994906,6.78944e-20,1.27141e-20,0.00359623,0.00132936,0.000126779,5.32942e-20,6.86091e-07,4.0612e-05,=,,,,not computed
+cpu,cold,TP,100,3412,108.267671,4.37041e+06,,,20,100,,0.998276,1.42972e-19,3.83792e-20,0.00165832,6.50373e-05,0,2.58939e-20,0,2.59074e-07,=,,,,not computed
+cpu,cold,TP,100,3423,107.860785,252953,,,20,100,,0.97063,1.97046e-18,6.04685e-19,0.0200693,0.00928317,0,3.78333e-19,2.77592e-06,1.50283e-05,=,,,,not computed
+cpu,cold,TP,100,3544,104.815497,7.61783e+06,,,20,100,,0.974997,1.22684e-20,5.53057e-33,0.0176982,0.00208689,0,0,2.46353e-05,0.00519327,=,,,,not computed
+cpu,cold,TP,100,3560,104.271748,202420,,,20,100,,0.969375,3.36874e-19,8.53712e-20,0.0177525,0.0126315,2.6021e-08,8.21327e-19,0,0.000241163,=,,,,not computed
+cpu,cold,TP,100,3564,101.934059,6.86213e+06,,,20,100,,0.979809,2.51218e-21,3.4125e-22,0.00109883,0.0122586,0.00683356,4.12009e-20,0,2.37662e-07,=,,,,not computed
+cpu,cold,TP,100,3566,100.407884,384684,,,20,100,,0.999202,1.80529e-20,1.3098e-20,0.000498962,0.000299439,0,9.3515e-21,0,1.2228e-08,=,,,,not computed
+cpu,cold,TP,100,3582,102.247084,9.18495e+06,,,20,100,,0.944685,2.28544e-21,4.30809e-23,0.046102,0.00899841,8.46928e-07,1.56037e-18,0,0.000213236,=,,,,not computed
+cpu,cold,TP,100,3598,100.081505,433993,,,20,100,,0.987077,1.29184e-20,6.55582e-21,0.000829753,0.0119043,9.29804e-07,1.63028e-20,1.27698e-08,0.000188125,20,100,,0.987077|1.29184e-20|6.55582e-21|0.000829753|0.0119043|9.29804e-07|1.63028e-20|1.27698e-08|0.000188125,not computed
+cpu,cold,TP,100,3626,103.650259,3.92658e+06,,,20,100,,0.976371,1.21905e-20,2.66419e-32,0.0146966,0.000285966,0.000202841,0,0,0.00844373,=,,,,not computed
+cpu,cold,TP,100,3664,100.674752,2.87512e+06,,,20,100,,0.9484,2.7637e-21,1.11903e-22,0.0220962,0.0258428,5.67289e-05,8.121e-19,0,0.00360399,20,100,,0.9484|2.7637e-21|1.11903e-22|0.0220962|0.0258428|5.67289e-05|8.121e-19|0|0.00360399,not computed
+cpu,cold,TP,100,3666,105.316838,822417,,,20,100,,0.994885,1.5185e-19,4.01617e-20,0.00504422,6.41935e-05,5.75942e-06,1.52093e-19,0,5.05006e-07,=,,,,not computed
+cpu,cold,TP,100,3677,103.525721,8.34981e+06,,,20,100,,0.965796,5.37917e-21,1.02599e-33,0.0338022,0.000318154,0,0,3.20184e-07,8.35014e-05,=,,,,not computed
+cpu,cold,TP,100,3703,101.737234,9.1579e+06,,,20,100,,0.973478,1.66965e-21,8.45956e-23,0.00565814,0.0208594,2.75346e-07,1.86733e-19,0,4.12337e-06,=,,,,not computed
+cpu,cold,TP,100,3732,102.430380,2.75361e+06,,,20,100,,0.998831,8.57194e-21,3.9774e-21,0.000266307,0.000109409,0.000765025,1.06003e-20,0,2.83324e-05,=,,,,not computed
+cpu,cold,TP,100,3734,105.707580,2.71447e+06,,,20,100,,0.93729,5.53294e-20,3.41791e-21,0.0293285,0.0329301,0.000396555,5.98049e-19,0,5.48953e-05,=,,,,not computed
+cpu,cold,TP,100,3757,109.446544,1.41028e+06,,,2,1,,0.954834,0.0157635,0,0.0272198,1.88046e-08,6.38167e-06,0.00185903,1.19357e-05,0.000305348,20,100,,0.956612|8.0796e-19|1.08219e-19|0.025408|0.0157929|6.39356e-06|7.73005e-19|1.1958e-05|0.00216841,ref 101 T=109.446544; dev not computed (not converged)
+cpu,cold,TP,100,3771,101.223879,167374,,,20,100,,0.977965,6.83131e-20,1.28109e-20,0.0205777,7.28651e-05,0,5.56719e-19,0.000792824,0.000591415,=,,,,not computed
+cpu,cold,TP,100,3788,104.548238,378594,,,20,100,,0.939784,2.10582e-19,2.49798e-20,0.0458186,0.0140348,3.00749e-08,1.64771e-18,0.000314535,4.77706e-05,=,,,,not computed
+cpu,cold,TP,100,3864,100.484891,75280.1,,,20,100,,0.966882,9.67479e-20,1.97113e-20,0.0329026,0.000202098,0,1.12985e-18,0,1.35504e-05,=,,,,not computed
+cpu,cold,TP,100,3874,101.550798,994319,,,20,100,,0.991412,1.40364e-20,1.73821e-21,0.00855116,3.68474e-05,0,3.6979e-19,0,1.44945e-07,=,,,,not computed
+cpu,cold,TP,100,3895,100.722573,3.43731e+06,,,20,100,,0.975185,2.4445e-21,4.87545e-33,0.0213849,0.000192061,1.20638e-07,0,0,0.0032375,=,,,,not computed
+cpu,cold,TP,100,3896,104.320373,222719,,,20,100,,0.996138,3.18897e-19,1.68198e-19,0.00381172,4.7573e-05,2.23852e-06,2.24493e-20,0,5.62297e-08,=,,,,not computed
+cpu,cold,TP,100,3912,101.104461,2.87909e+06,,,20,100,,0.990601,3.66514e-21,1.19737e-21,0.000380965,0.00836154,0,9.28899e-21,0.00065324,3.23857e-06,=,,,,not computed
+cpu,cold,TP,100,3935,106.956748,2.42011e+06,,,20,100,,0.974403,1.24892e-19,2.58398e-20,0.00381401,0.0212924,0,6.93937e-20,1.39253e-07,0.000490781,=,,,,not computed
+cpu,cold,TP,100,3939,104.201445,7.03095e+06,,,2,1,,0.965529,0.023906,0,0.0105294,0,0,2.17018e-08,3.51498e-05,1.58928e-08,20,100,,0.96553|9.21135e-21|5.07664e-22|0.0105293|0.023906|0|4.21463e-19|3.51498e-05|3.75946e-08,ref 101 T=104.201445; dev not computed (not converged)
+cpu,cold,TP,100,3969,107.305622,2.40078e+06,,,20,100,,0.9558,1.53096e-19,1.20239e-20,0.0287734,0.0142263,6.46996e-05,4.84638e-19,5.26072e-07,0.00113517,=,,,,not computed
+cpu,cold,TP,100,3972,102.790148,359009,,,20,100,,0.992253,8.13977e-20,2.022e-20,0.00770865,3.87106e-05,0,2.2488e-19,1.12625e-08,4.71505e-08,=,,,,not computed
+cpu,cold,TP,100,3977,100.758392,153450,,,20,100,,0.983389,5.61649e-20,1.1643e-20,0.016582,2.18873e-05,2.9229e-06,6.6381e-19,0,3.84682e-06,=,,,,not computed
+cpu,cold,TP,100,3990,102.749588,2.38218e+06,,,20,100,,0.966363,1.17119e-20,1.4905e-32,0.0114373,0.0142057,9.92438e-08,0,0.00177794,0.00621576,=,,,,not computed
+cpu,cold,TP,100,4033,101.918942,34716.6,,,2,1,,0.953284,0.036302,0,0.0104119,0,1.55553e-08,1.58562e-06,0,5.46252e-08,20,100,,0.953286|4.8345e-19|2.96829e-19|0.0104103|0.0363021|1.55553e-08|1.27809e-19|0|1.64024e-06,ref 101 T=101.918942; dev not computed (not converged)
+cpu,cold,TP,100,4034,106.887797,8.28211e+06,,,20,100,,0.982543,3.56025e-20,2.70568e-21,0.00825264,0.00594936,0,3.38071e-19,0,0.00325517,20,100,,0.982543|3.56025e-20|2.70568e-21|0.00825264|0.00594936|0|3.38071e-19|0|0.00325517,not computed
+cpu,cold,TP,100,4063,100.649072,95851.4,,,20,100,,0.988781,8.32779e-20,6.79843e-20,0.00165443,0.00950515,0,9.97894e-21,0,5.95471e-05,=,,,,not computed
+cpu,cold,TP,100,4078,102.590702,8.58435e+06,,,20,100,,0.989196,3.00103e-21,2.62533e-22,0.00246947,0.00106705,0,8.08158e-20,0.00688033,0.000387016,=,,,,not computed
+cpu,cold,TP,100,4095,100.598508,2.29742e+06,,,20,100,,0.971783,3.37633e-21,1.0363e-32,0.0210693,0.000131371,2.12617e-08,0,1.55873e-05,0.00700042,20,100,,0.971783|3.37633e-21|1.0363e-32|0.0210693|0.000131371|2.12617e-08|0|1.55873e-05|0.00700042,not computed
+cpu,cold,TP,100,4114,100.432145,18882.3,,,20,100,,0.977118,3.72812e-19,1.87779e-19,0.0211779,0.00170386,0,6.9351e-19,1.92734e-08,6.0362e-07,=,,,,not computed
+cpu,cold,TP,100,4130,107.938364,440383,,,20,100,,0.983461,1.1897e-18,3.17384e-19,0.0156172,0.000919369,0,3.23936e-19,0,2.77326e-06,=,,,,not computed
+cpu,cold,TP,100,4153,106.252671,6.28738e+06,,,20,100,,0.99221,3.34232e-20,2.83351e-21,0.00776525,2.42053e-05,0,2.7148e-19,3.1564e-08,8.00181e-07,=,,,,not computed
+cpu,cold,TP,100,4173,106.927006,9.28891e+06,,,20,100,,0.966147,3.27091e-20,1.17952e-21,0.0332211,2.62914e-05,0,1.14758e-18,0,0.000605314,=,,,,not computed
+cpu,cold,TP,100,4234,100.498978,3.60304e+06,,,20,100,,0.997526,2.03571e-21,1.26477e-32,0.000628181,1.02119e-05,7.86108e-05,0,0,0.00175683,20,100,,0.997526|2.03571e-21|1.26477e-32|0.000628181|1.02119e-05|7.86108e-05|0|0|0.00175683,not computed
+cpu,cold,TP,100,4253,100.536732,239499,,,20,100,,0.9885,3.13503e-20,6.5973e-21,0.0097932,8.5707e-05,0.00160597,3.53416e-19,3.02416e-06,1.16635e-05,=,,,,not computed
+cpu,cold,TP,100,4260,104.114108,7.20614e+06,,,20,100,,0.980246,8.68504e-21,4.53192e-22,0.0114328,0.00732279,0.000998752,2.61456e-19,0,5.23264e-08,=,,,,not computed
+cpu,cold,TP,100,4272,103.501141,9.96071e+06,,,20,100,,0.962649,4.42957e-21,1.08042e-22,0.033413,2.59281e-05,4.30003e-05,1.16713e-18,0.00386934,1.60496e-08,=,,,,not computed
+cpu,cold,TP,100,4300,107.273272,7.02403e+06,,,2,1,,0.956234,0.0426543,0,0.00101993,0,0,7.35167e-05,1.8232e-05,1.72166e-08,20,100,,0.956304|4.99935e-20|1.24401e-20|0.000946481|0.0426574|0|8.82981e-21|1.82333e-05|7.35393e-05,ref 101 T=107.273272; dev not computed (not converged)
+cpu,cold,TP,100,4313,107.013700,283530,,,20,100,,0.954463,1.08423e-18,4.01656e-19,0.0101269,0.0351419,0,2.22146e-19,0,0.000268324,=,,,,not computed
+cpu,cold,TP,100,4326,106.390960,184482,,,20,100,,0.965476,1.22021e-18,3.26033e-19,0.0271931,0.000271421,0,3.31635e-19,0.00704561,1.37481e-05,=,,,,not computed
+cpu,cold,TP,100,4340,106.075160,533452,,,20,100,,0.966194,3.54576e-19,5.46292e-20,0.026544,0.00725288,0,6.78401e-19,8.11305e-06,1.05698e-06,=,,,,not computed
+cpu,cold,TP,100,4347,104.410459,2.535e+06,,,20,100,,0.981933,2.94623e-20,2.21136e-21,0.0168306,0.000167829,0.00100851,4.40299e-19,0,6.00184e-05,=,,,,not computed
+cpu,cold,TP,100,4362,101.646731,590403,,,20,100,,0.95916,2.50417e-20,1.86652e-21,0.0405921,0.000125531,0,1.367e-18,4.80152e-05,7.39442e-05,=,,,,not computed
+cpu,cold,TP,100,4363,102.134153,3.78928e+06,,,20,100,,0.954028,5.22128e-21,7.42761e-34,0.0448183,0.000170615,2.80038e-08,0,0,0.000983371,=,,,,not computed
+cpu,cold,TP,100,4406,101.772851,2.93254e+06,,,20,100,,0.959027,5.25054e-21,4.52254e-22,0.00607352,0.0261307,1.50949e-08,2.00564e-19,0,0.00876916,20,100,,0.959027|5.25055e-21|4.52254e-22|0.00607352|0.0261307|1.50949e-08|2.00564e-19|0|0.00876916,not computed
+cpu,cold,TP,100,4443,101.732422,8.66299e+06,,,20,100,,0.995453,1.7956e-21,1.19578e-22,0.00352875,5.16989e-05,5.31522e-08,6.57573e-20,0,0.000966898,=,,,,not computed
+cpu,cold,TP,100,4455,100.384034,188582,,,20,100,,0.984962,3.61267e-20,8.19224e-21,0.0103176,0.00257724,0.00027144,3.62516e-19,0.00177573,9.60362e-05,=,,,,not computed
+cpu,cold,TP,100,4460,100.615012,24318.5,,,20,100,,0.994127,3.24069e-19,3.21778e-19,0.00441009,0.00142309,6.52975e-06,4.80353e-20,1.15144e-06,3.21203e-05,=,,,,not computed
+cpu,cold,TP,100,4491,108.959426,9.01007e+06,,,20,100,,0.955899,9.96622e-20,3.95847e-21,0.0418823,0.00127064,0.000824856,1.26485e-18,9.54235e-05,2.79671e-05,=,,,,not computed
+cpu,cold,TP,100,4496,101.218615,1.95167e+06,,,20,100,,0.948696,5.67793e-21,2.96022e-22,0.0221744,0.0291295,5.34641e-08,5.52717e-19,0,1.48437e-08,=,,,,not computed
+cpu,cold,TP,100,4510,100.463693,1.31077e+06,,,20,100,,0.990066,5.46124e-21,6.47996e-22,0.00552167,0.00441203,0,1.52431e-19,0,4.47901e-07,=,,,,not computed
+cpu,cold,TP,100,4525,107.097148,2.41178e+06,,,20,100,,0.995942,1.38184e-19,3.07912e-20,0.0034661,0.000592232,0,9.61074e-20,0,4.37086e-08,=,,,,not computed
+cpu,cold,TP,100,4526,100.969989,1.22252e+06,,,20,100,,0.998377,8.01252e-21,6.71531e-21,0.000133307,0.00144853,2.11201e-05,1.29613e-21,0,1.96061e-05,=,,,,not computed
+cpu,cold,TP,100,4527,103.852704,6.12342e+06,,,20,100,,0.999535,8.86642e-21,2.57147e-21,0.000415689,2.06892e-05,2.83084e-05,6.1502e-21,0,4.27299e-08,=,,,,not computed
+cpu,cold,TP,100,4529,101.160505,503097,,,20,100,,0.984998,2.16857e-20,4.60417e-21,0.0052226,0.00031704,0.0094423,1.80242e-19,0,2.01125e-05,=,,,,not computed
+cpu,cold,TP,100,4575,101.489273,537798,,,20,100,,0.950772,2.42093e-20,2.79492e-21,0.0173746,0.018248,1.31602e-06,6.55783e-19,1.10802e-08,0.0136042,20,100,,0.950772|2.42093e-20|2.79492e-21|0.0173746|0.018248|1.31602e-06|6.55783e-19|1.10802e-08|0.0136042,not computed
+cpu,cold,TP,100,4586,109.585259,1.10203e+06,,,20,100,,0.987847,1.12946e-18,2.73021e-19,0.010418,0.00173479,0,1.47487e-19,0,4.2579e-07,=,,,,not computed
+cpu,cold,TP,100,4599,109.415260,4.00535e+06,,,20,100,,0.954632,2.84984e-19,1.70769e-20,0.0452409,1.50478e-05,0,1.74934e-18,3.69694e-05,7.50247e-05,=,,,,not computed
+cpu,cold,TP,100,4608,101.778543,628966,,,20,100,,0.978925,2.49385e-20,1.23426e-20,0.000871859,0.0200739,0.000128709,1.35001e-20,0,5.77439e-08,=,,,,not computed
+cpu,cold,TP,100,4636,109.276590,310245,,,20,100,,0.964453,3.40473e-18,8.85451e-19,0.0300405,0.00475847,0,1.00819e-18,0.000746987,1.11165e-06,=,,,,not computed
+cpu,cold,TP,100,4656,101.074785,7.80697e+06,,,20,100,,0.99505,1.33429e-21,1.59594e-22,0.00104658,0.00106312,0,3.93734e-20,0,0.00284071,=,,,,not computed
+cpu,cold,TP,100,4660,106.886637,379625,,,20,100,,0.964241,7.82249e-19,1.36847e-19,0.0342329,0.00123996,0.000285741,1.12673e-18,0,9.14847e-07,=,,,,not computed
+cpu,cold,TP,100,4689,101.326857,381089,,,20,100,,0.968039,3.18831e-20,3.38551e-21,0.0287904,0.000576381,2.22615e-05,7.96533e-19,0,0.00257181,=,,,,not computed
+cpu,cold,TP,100,4695,100.145304,467713,,,20,100,,0.982747,1.24099e-20,1.05452e-20,0.000277236,0.0154552,0.00145768,7.52596e-21,0,6.25243e-05,=,,,,not computed
+cpu,cold,TP,100,4698,104.061201,177204,,,20,100,,0.985807,3.42362e-19,1.68752e-19,0.00514922,0.00904285,9.85234e-08,6.00959e-20,0,8.30455e-07,=,,,,not computed
+cpu,cold,TP,100,4706,100.558439,741968,,,20,100,,0.993241,1.027e-20,1.51861e-21,0.00644264,0.000146577,0,2.02269e-19,0.000169468,3.04009e-07,=,,,,not computed
+cpu,cold,TP,100,4769,100.017448,608819,,,20,100,,0.95111,8.82457e-21,1.52134e-33,0.0340537,0.0109015,0,0,0,0.00393449,=,,,,not computed
+cpu,cold,TP,100,4774,104.381016,3.06392e+06,,,20,100,,0.973793,2.34439e-20,3.70378e-21,0.0030553,0.0230361,0,1.04249e-19,0.000115108,8.11894e-08,=,,,,not computed
+cpu,cold,TP,100,4787,102.710911,1.28436e+06,,,20,100,,0.98262,2.13436e-20,1.46083e-20,0.000274276,0.017073,0,3.63832e-21,0,3.24867e-05,20,100,,0.98262|2.13436e-20|1.46083e-20|0.000274276|0.017073|0|3.63832e-21|0|3.24867e-05,not computed
+cpu,cold,TP,100,4790,103.944138,6.83446e+06,,,20,100,,0.985896,8.26918e-21,1.18205e-21,0.00154336,0.0122349,0,3.14752e-20,0,0.000325999,=,,,,not computed
+cpu,cold,TP,100,4821,103.585266,9.70783e+06,,,20,100,,0.985774,4.73676e-21,9.3601e-33,0.00284731,0.0104514,0,0,0,0.000926823,20,100,,0.985774|4.73676e-21|9.3601e-33|0.00284731|0.0104514|0|0|0|0.000926823,not computed
+cpu,cold,TP,100,4830,100.489982,7.73166e+06,,,20,100,,0.99554,9.44698e-22,4.31462e-34,0.0039713,0.000451392,1.59152e-07,0,0,3.74288e-05,=,,,,not computed
+cpu,cold,TP,100,4834,103.078875,45216,,,20,100,,0.965911,7.65432e-19,2.64432e-19,0.0336536,0.000281399,0.000154142,1.26715e-18,3.64611e-08,2.81279e-07,=,,,,not computed
+cpu,cold,TP,100,4840,104.381424,786880,,,20,100,,0.957472,8.97185e-20,3.13557e-20,0.00238891,0.0401083,1.79268e-05,7.80509e-20,0,1.26715e-05,20,100,,0.957472|8.97185e-20|3.13557e-20|0.00238891|0.0401083|1.79268e-05|7.80509e-20|0|1.26715e-05,not computed
+cpu,cold,TP,100,4873,101.368630,1.2226e+06,,,20,100,,0.951816,1.00053e-20,6.13389e-22,0.0266723,0.0206168,0,7.07565e-19,3.58248e-07,0.00089487,=,,,,not computed
+cpu,cold,TP,100,4880,106.829933,2.67443e+06,,,2,1,,0.929589,0.0274019,0,0.0429711,0,7.23009e-07,1.10685e-05,0,2.62363e-05,20,100,,0.929599|1.04865e-19|6.05494e-21|0.0429605|0.0274022|7.23017e-07|1.02666e-18|0|3.73053e-05,ref 101 T=106.829933; dev not computed (not converged)
+cpu,cold,TP,100,4966,106.744638,494452,,,20,100,,0.952937,5.56509e-19,7.20233e-20,0.0467415,0.000297626,2.23408e-05,1.24861e-18,1.41843e-06,6.77693e-08,=,,,,not computed
+cpu,cold,TP,100,5000,104.186172,1.94675e+06,,,20,100,,0.952024,3.34303e-20,3.00734e-32,0.0374229,3.10155e-06,0.00333276,0,0,0.00721715,=,,,,not computed
+cpu,cold,UVkkt,100,15,101.174559,1.43367e+06,3.94734,-7.07373e+06,20,100,103.021974,1693.87,3.90968e-17,5.79091e-18,9.55135,0.0234635,0,1.06341e-17,0.00014815,0.847771,=,,,,not computed
+cpu,cold,UVkkt,100,167,100.347785,6.46685e+06,16.4524,-3.21709e+07,2,1,100.347785,7748.23,0.467372,0,2.18426,0,0,0.130649,0,0.000814148,20,100,100.558501,7748.23|9.1171e-18|2.2498e-18|2.05361|0.467372|0|5.38669e-19|0|0.131463,ref 101 T=100.558501; dev not computed (not converged)
+cpu,cold,UVkkt,100,185,101.373502,4.83939e+06,12.5417,-2.3707e+07,20,100,101.478988,5728.59,1.58398e-17,1.72876e-18,12.7705,0.188826,0.00888086,3.03121e-17,0,0.0380614,=,,,,not computed
+cpu,cold,UVkkt,100,253,103.086954,6.29501e+06,15.9387,-3.00613e+07,2,1,103.086954,7330.78,0.777835,0,12.8892,0,0,0.000390309,0,0.000114626,20,100,103.348444,7330.78|4.71677e-17|6.21751e-18|12.8888|0.777835|0|8.15013e-19|0|0.000504935,ref 101 T=103.348444; dev not computed (not converged)
+cpu,cold,UVkkt,100,328,101.327258,2.85643e+06,8.28151,-1.40015e+07,20,100,101.454901,3355.38,1.56145e-17,1.02773e-18,34.9358,0.174802,0,1.14781e-16,0,0.000256122,=,,,,not computed
+cpu,cold,UVkkt,100,557,100.427555,3.85237e+06,11.276,-1.91405e+07,20,100,100.563147,4565.62,9.14279e-18,4.68212e-19,47.7306,0.277125,0.00193954,4.95289e-18,0,0.0015953,=,,,,not computed
+cpu,cold,UVkkt,100,672,107.955211,7.80221e+06,29.4218,-3.47328e+07,20,100,110.078845,8344.82,0,8.54863e-17,340.408,0,0.588516,2.88522e-16,0.0362412,3.58672,=,,,,not computed
+cpu,cold,UVkkt,100,702,102.079782,1.80923e+06,4.55505,-8.84969e+06,20,100,102.080139,2131.24,0,1.42066e-17,0.436529,0,0,2.56889e-18,2.15715,0.0280047,=,,,,not computed
+cpu,cold,UVkkt,100,885,102.211197,5.06777e+06,12.9135,-2.45181e+07,20,100,103.223731,5952.19,4.39108e-17,6.97343e-18,8.65759,2.38403,0.000515839,1.16679e-16,0,0.0426112,=,,,,not computed
+cpu,cold,UVkkt,100,899,109.434429,7.45614e+06,17.9247,-3.27142e+07,20,100,110.275492,8178.12,1.93997e-15,4.65863e-16,14.469,0.252206,3.5214,4.17222e-17,0.00232999,1.72575,=,,,,not computed
+cpu,cold,UVkkt,100,949,104.537536,3.5925e+06,10.867,-1.67942e+07,20,100,104.641823,4066.39,9.80555e-17,6.46887e-18,66.6863,0.000555846,0.00743826,4.03516e-18,0.0209217,0.0835685,=,,,,not computed
+cpu,cold,UVkkt,100,965,100.428833,1.37332e+06,5.69,-6.85898e+06,20,100,100.507582,1575.87,8.84008e-18,3.74938e-19,68.7594,0.0519796,0.000508568,8.14602e-18,0.870235,0.0458488,=,,,,not computed
+cpu,cold,UVkkt,100,1240,101.201770,2.27169e+06,7.41033,-1.12354e+07,20,100,101.201808,2647.2,1.3427e-17,7.01372e-19,52.575,1.25459,0,4.95225e-18,0,0.0835094,=,,,,not computed
+cpu,cold,UVkkt,100,1386,101.955376,4.8851e+06,12.371,-2.40179e+07,20,100,102.246769,5760.65,2.49173e-17,8.81948e-18,1.42577,0.637915,0,1.95289e-17,8.26072,0.029709,=,,,,not computed
+cpu,cold,UVkkt,100,1576,105.764053,9.34301e+06,22.6086,-4.28979e+07,20,100,106.303510,10618.4,2.44517e-16,7.77277e-17,3.96932,2.25539,0,2.08082e-16,0,0.0501961,=,,,,not computed
+cpu,cold,UVkkt,100,1705,101.413142,3.20133e+06,9.28588,-1.58252e+07,20,100,103.341922,3758.38,4.69917e-17,3.73329e-18,35.4358,0.222559,0,7.80324e-17,0.26429,2.55717,=,,,,not computed
+cpu,cold,UVkkt,100,1725,102.240566,4.1998e+06,11.1134,-2.03545e+07,20,100,102.367605,4919.94,2.6742e-17,2.53871e-18,20.3223,8.06999e-05,0,1.01284e-17,1.28559,0.121651,=,,,,not computed
+cpu,cold,UVkkt,100,1739,101.440292,5.25391e+06,20.2277,-2.59771e+07,20,100,101.736073,6010.51,1.84487e-17,5.00638e-19,218.04,5.38633,0,9.53272e-19,0,0.0822781,=,,,,not computed
+cpu,cold,UVkkt,100,1741,100.898622,2.0257e+06,6.50832,-1.23539e+07,20,100,101.455036,2403.02,1.56158e-17,1.82462e-18,11.0857,0.368635,0,7.55296e-18,3.82169e-05,20.5022,=,,,,not computed
+cpu,cold,UVkkt,100,1809,100.749828,1.83793e+06,4.81361,-9.14267e+06,20,100,101.973320,2188.76,2.12213e-17,4.24185e-18,4.22321,1.08571,0,4.11298e-18,1.55896,0.0016263,=,,,,not computed
+cpu,cold,UVkkt,100,2028,105.820877,2.8743e+06,7.32818,-1.31875e+07,20,100,106.617842,3253,2.89713e-16,5.28408e-17,12.803,0.984391,0,1.05092e-16,5.81966e-05,0.0501427,=,,,,not computed
+cpu,cold,UVkkt,100,2153,100.985501,4.22491e+06,10.9763,-2.11117e+07,20,100,102.043521,5023.92,2.21161e-17,3.6996e-18,6.11898,4.59713,0,2.55649e-17,1.54723,0.902413,=,,,,not computed
+cpu,cold,UVkkt,100,2214,100.649176,2.71307e+06,7.23184,-1.39924e+07,20,100,102.663678,3234.38,3.17753e-17,6.28404e-18,4.97807,2.55691,10.0476,4.58058e-18,0.000144109,0.0560104,=,,,,not computed
+cpu,cold,UVkkt,100,2285,103.102403,8.79328e+06,22.4435,-4.37479e+07,20,100,103.163970,10256.8,4.24282e-17,2.51168e-17,0.615518,0.20112,4.66869,2.62724e-18,0.000430753,13.0781,=,,,,not computed
+cpu,cold,UVkkt,100,2300,101.462309,7.50704e+06,22.068,-3.83469e+07,20,100,101.514285,8820.66,1.61756e-17,7.17308e-19,77.9321,0.17805,0,3.96978e-19,45.5732,0.00743177,=,,,,not computed
+cpu,cold,UVkkt,100,2545,106.518575,2.7091e+06,7.01631,-1.26224e+07,20,100,108.128572,3045.01,6.45544e-16,1.40726e-16,11.8993,1.96483,0,4.54108e-17,0,2.80171,20,100,108.128572,3045.01|6.45544e-16|1.40726e-16|11.8993|1.96483|0|3.45153e-17|0|2.80171,not computed
+cpu,cold,UVkkt,100,2646,101.113456,3.06613e+06,9.94216,-1.5078e+07,20,100,103.243798,3575.51,4.44198e-17,2.514e-18,68.4452,3.15372,0,6.95795e-19,0,0.00265991,=,,,,not computed
+cpu,cold,UVkkt,100,2697,103.325290,6.27021e+06,17.1114,-3.10933e+07,2,1,103.325290,7261.68,3.27159,0,33.684,0,4.28865,0.150515,28.4461,0.0176709,20,100,104.493840,7261.68|9.02633e-17|8.2752e-18|33.5335|3.27159|4.28865|8.61243e-19|28.4461|0.168186,ref 101 T=104.493840; dev not computed (not converged)
+cpu,cold,UVkkt,100,2858,102.591291,1.57366e+06,4.73276,-7.57101e+06,20,100,102.665049,1818.73,0,2.74729e-18,26.0943,0,0,1.01403e-18,0.00129342,0.0328595,=,,,,not computed
+cpu,cold,UVkkt,100,2891,106.593553,4.49248e+06,16.5696,-2.03967e+07,20,100,107.008323,4885.83,3.57157e-16,1.79021e-17,182.554,0.0832445,0,8.15648e-18,0,0.520713,=,,,,not computed
+cpu,cold,UVkkt,100,3103,100.913436,1.19881e+06,4.91045,-5.99734e+06,20,100,101.184570,1370.78,1.32893e-17,6.6052e-19,57.858,0.157145,0,2.44341e-18,2.3576,0.00558403,20,100,101.184570,1370.78|1.32893e-17|6.6052e-19|57.858|0.157145|0|2.44341e-18|2.3576|0.00558403,not computed
+cpu,cold,UVkkt,100,3253,107.258343,4.83336e+06,12.2513,-2.17316e+07,20,100,107.497005,5394.75,4.63091e-16,6.62028e-17,24.602,0.314705,0.232244,8.08185e-17,0.000664035,0.142765,20,100,107.497005,5394.75|4.63091e-16|6.62028e-17|24.602|0.314705|0.232244|8.08185e-17|0.000664035|0.142765,not computed
+cpu,cold,UVkkt,100,3302,101.251694,3.22871e+06,9.02942,-1.6302e+07,20,100,102.023798,3812.93,2.18611e-17,1.95078e-18,21.4148,0.272384,0,4.20887e-18,12.1908,0.641303,=,,,,not computed
+cpu,cold,UVkkt,100,3624,107.818532,9.98609e+06,31.1169,-4.48512e+07,20,100,108.458473,10907.3,7.66661e-16,3.91749e-17,230.155,0.495493,0.0147136,6.76199e-18,8.30416,1.62562,=,,,,not computed
+cpu,cold,UVkkt,100,4078,102.590702,8.58435e+06,23.6216,-4.42308e+07,20,100,105.212058,10028.9,1.34612e-16,1.53298e-17,25.0367,10.8182,0,4.28509e-16,69.756,3.92375,=,,,,not computed
+cpu,cold,UVkkt,100,4146,104.628301,520979,1.38024,-2.53883e+06,20,100,104.679807,596.79,1.00158e-16,3.76111e-17,2.07373,0.011987,0.300997,1.3387e-17,2.54004,0.000463007,=,,,,not computed
+cpu,cold,UVkkt,100,4153,106.252671,6.28738e+06,16.8033,-2.86622e+07,20,100,106.315136,7061.54,2.4606e-16,2.09857e-17,55.2652,0.172269,0,1.79683e-16,0.000224641,0.00569487,=,,,,not computed
+cpu,cold,UVkkt,100,4173,106.927006,9.28891e+06,33.4594,-4.19317e+07,20,100,110.105059,10088.4,1.78054e-15,8.60108e-17,346.892,0.274533,0,5.41e-17,0,6.32065,=,,,,not computed
+cpu,cold,UVkkt,100,4185,101.145859,276554,1.21507,-1.58569e+06,20,100,101.245471,315.693,1.37819e-17,1.4465e-18,13.1439,0.0130007,0,3.72609e-19,0,1.95809,=,,,,not computed
+cpu,cold,UVkkt,100,4253,100.536732,239499,0.703924,-1.21355e+06,20,100,100.807893,283.672,1.05996e-17,2.29646e-18,2.81038,0.0245955,0.460868,2.91526e-19,0.000867851,0.00334709,=,,,,not computed
+cpu,cold,UVkkt,100,4272,103.501141,9.96071e+06,37.6406,-4.89075e+07,20,100,103.541833,11186.3,5.26839e-17,1.29033e-18,388.269,0.301293,0.499677,2.2388e-17,44.9629,0.000186501,=,,,,not computed
+cpu,cold,UVkkt,100,4443,101.732422,8.66299e+06,23.3025,-4.32685e+07,20,100,102.232455,10203.6,2.47093e-17,1.73382e-18,36.1703,0.529923,0.000544819,6.88307e-18,0,9.91088,=,,,,not computed
+cpu,cold,UVkkt,100,4506,100.592961,566152,1.98449,-2.8059e+06,2,1,100.592961,659.356,0.41207,0,17.1432,0,1.09969e-05,0.00194523,0.00234882,8.35697e-05,20,100,102.107153,659.356|2.29586e-17|2.30988e-18|17.1412|0.41207|1.09969e-05|1.84019e-17|0.00234882|0.0020288,ref 101 T=102.107153; dev not computed (not converged)
+cpu,cold,UVkkt,100,4529,101.160505,503097,1.47064,-2.7888e+06,20,100,102.026794,594.776,2.18996e-17,5.09404e-18,3.15359,0.19144,5.70159,2.09991e-17,0,0.0121446,=,,,,not computed
+cpu,cold,UVkkt,100,4547,105.952431,2.79144e+06,7.52626,-1.28784e+07,2,1,105.952431,3143.51,1.00403,0,24.2009,0,0,0.000390266,0,0.844882,20,100,106.731267,3143.51|3.0792e-16|4.12923e-17|24.2005|1.00403|0|7.85018e-17|0|0.845273,ref 101 T=106.731267; dev not computed (not converged)
+cpu,cold,UVkkt,100,4706,100.558439,741968,2.0622,-3.6888e+06,20,100,100.697033,881.659,9.91389e-18,1.48795e-18,5.71886,0.13011,0,2.69193e-20,0.150429,0.000269856,=,,,,not computed
+cpu,cold,UVkkt,100,4949,102.015644,1.37076e+06,4.63374,-7.19945e+06,2,1,102.015644,1585.49,0,0,30.5754,0,0,0.00096938,0,4.74792,20,100,102.017809,1585.49|0|1.62586e-18|30.5745|0|0|2.35402e-19|0|4.74889,ref 001 T=102.017809; dev not computed (not converged)
+gpu0,wide,TP,100,38,299.014652,190110,,,20,100,,0.993694,0.00225815,0,0.000323237,0,0.00371823,6.22423e-06,0,0,=,,,,not computed
+gpu0,wide,TP,100,63,349.670241,20209.2,,,20,100,,0.998317,0,0.000141164,1.15375e-05,1.64509e-06,0.00152896,0,0,0,=,,,,not computed
+gpu0,wide,TP,100,69,302.381488,13661.2,,,20,100,,0.999148,0.000543841,0,0,0,0,1.7439e-06,0,0.0003067,=,,,,not computed
+gpu0,wide,TP,100,70,297.246299,165407,,,20,100,,0.972949,0.0130136,0,0.0140376,0,0,1.7853e-07,6.48909e-08,0,=,,,,not computed
+gpu0,wide,TP,100,229,298.171005,55845,,,20,100,,0.981902,0.0166209,0,0,0,0.00146843,8.90268e-06,0,0,=,,,,not computed
+gpu0,wide,TP,100,265,348.290179,26352.7,,,20,100,,0.999794,0,7.29107e-05,5.31283e-05,7.98043e-05,0,0,0,0,=,,,,not computed
+gpu0,wide,TP,100,267,342.007039,117937,,,20,100,,0.973133,0.0258316,0,0.00103204,0,0,3.63697e-06,0,0,=,,,,not computed
+gpu0,wide,TP,100,276,335.385026,22860.2,,,20,100,,0.99987,8.97918e-05,0,0,0,7.37623e-06,3.26343e-05,0,0,=,,,,not computed
+gpu0,wide,TP,100,344,345.492278,55295.9,,,20,100,,0.993985,1.55521e-05,0,0.00419854,0,0.00180095,1.36349e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,388,346.001081,206797,,,20,100,,0.994855,0.0051127,0,3.05653e-05,0,1.44902e-07,9.54423e-08,1.37579e-06,0,=,,,,not computed
+gpu0,wide,TP,100,395,349.153390,58813.9,,,20,100,,0.994114,0.00069569,0,0,0,0.000181851,0.000411882,0.00459683,0,=,,,,not computed
+gpu0,wide,TP,100,409,284.189620,28371.3,,,20,100,,0.999015,3.38034e-05,0,0,0,1.71853e-08,0.000942748,9.05174e-07,7.3399e-06,=,,,,not computed
+gpu0,wide,TP,100,490,309.668177,32999.2,,,20,100,,0.998194,6.75098e-06,0,0,0,0,0.00179905,0,0,=,,,,not computed
+gpu0,wide,TP,100,518,336.149019,1.08987e+06,,,20,100,,0.988664,0.00011876,0,0.00059589,0,0,0.00896318,0.00165809,0,=,,,,not computed
+gpu0,wide,TP,100,543,284.680323,27341.2,,,20,100,,0.999863,4.52727e-05,0,0,0,0,8.39974e-07,7.05568e-05,2.04194e-05,=,,,,not computed
+gpu0,wide,TP,100,572,333.267822,13362.7,,,20,100,,0.99674,0,0.00113118,0.00126732,0.000861738,0,0,0,0,=,,,,not computed
+gpu0,wide,TP,100,573,336.955791,934785,,,20,100,,0.998266,8.00436e-05,0,0.00122305,0,0,0.000430695,0,0,=,,,,not computed
+gpu0,wide,TP,100,606,257.989458,155987,,,20,100,,0.989076,1.11183e-08,0,0.00761392,0,0.00325966,5.01233e-05,0,0,=,,,,not computed
+gpu0,wide,TP,100,617,348.355556,1.01457e+06,,,20,100,,0.98384,2.71744e-05,0,0.0156833,0,0.00044896,1.20622e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,643,298.465679,550377,,,20,100,,0.983006,0.00577357,0,5.05873e-05,0.00828347,0.00265945,0.00019963,2.7469e-05,0,=,,,,not computed
+gpu0,wide,TP,100,740,314.853237,267174,,,20,100,,0.995492,0.00047444,0,0.00403347,0,0,4.17113e-08,0,0,=,,,,not computed
+gpu0,wide,TP,100,755,328.183154,158364,,,20,100,,0.994309,0.00222383,0,0.00322166,0,0,0.000245398,3.52891e-08,0,=,,,,not computed
+gpu0,wide,TP,100,784,285.841915,41876.3,,,20,100,,1,0,0,0,0,3.51533e-08,1.03424e-08,0,0,=,,,,not computed
+gpu0,wide,TP,100,786,349.730259,157656,,,20,100,,0.996248,0.00368105,0,0,0,7.0542e-05,0,0,2.15081e-08,=,,,,not computed
+gpu0,wide,TP,100,851,336.631855,55945,,,20,100,,0.965045,0.0309429,0,0,0,0.00401042,0,0,1.52483e-06,=,,,,not computed
+gpu0,wide,TP,100,876,335.655340,108548,,,20,100,,0.999246,0,0,0,0,0.000175001,0.000577364,1.84075e-06,0,=,,,,not computed
+gpu0,wide,TP,100,967,271.752581,67003.5,,,20,100,,0.991165,0,0,0.00510472,0,0,0.00180874,0.00192165,0,=,,,,not computed
+gpu0,wide,TP,100,973,331.859012,49335.3,,,20,100,,0.991796,0.000552161,0,0.000585355,0,0.00706493,5.11597e-07,8.1239e-07,0,=,,,,not computed
+gpu0,wide,TP,100,997,316.956673,273234,,,20,100,,0.995378,0.00054035,0,0.00269329,0,0,0.0013879,0,0,=,,,,not computed
+gpu0,wide,TP,100,1036,343.786087,294645,,,20,100,,0.99969,0.000107837,0,0,0,0.000194028,9.40554e-08,0,8.28134e-06,=,,,,not computed
+gpu0,wide,TP,100,1049,333.409055,15527,,,20,100,,0.99741,0,0.000436907,0,1.42427e-08,0.00215269,0,0,0,=,,,,not computed
+gpu0,wide,TP,100,1064,345.555738,775439,,,20,100,,0.995952,4.45105e-06,0,0,0,5.80526e-06,1.66558e-06,0,0.00403573,=,,,,not computed
+gpu0,wide,TP,100,1085,340.372048,72495.7,,,20,100,,0.994025,0.00176392,0,0,0,0,0.00421092,0,0,=,,,,not computed
+gpu0,wide,TP,100,1125,322.929879,94349.5,,,20,100,,0.99732,0.00172042,0,0.000959083,0,0,7.93286e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,1218,258.675916,101599,,,20,100,,0.999632,0.000306996,0,5.87388e-05,0,5.42926e-07,2.01133e-06,0,0,=,,,,not computed
+gpu0,wide,TP,100,1331,289.549704,178130,,,20,100,,0.989784,8.65373e-05,0,0.0101279,0,0,5.41081e-07,1.04555e-06,0,=,,,,not computed
+gpu0,wide,TP,100,1374,318.851550,44863.9,,,20,100,,0.996354,0.000604174,0,0.00302536,0,8.91854e-07,1.5227e-05,2.78499e-08,0,=,,,,not computed
+gpu0,wide,TP,100,1379,289.402124,13113,,,20,100,,0.994761,0.00093373,0,0,0,6.52986e-08,0.00248599,0.00175981,5.99036e-05,=,,,,not computed
+gpu0,wide,TP,100,1419,309.178441,27088.5,,,20,100,,0.952132,0.0388908,0,0.00091789,0,0.00805921,5.51731e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,1545,301.848446,28110.2,,,20,100,,0.95956,0.0404343,0,0,0,0,1.62806e-06,4.34763e-06,0,=,,,,not computed
+gpu0,wide,TP,100,1551,257.698553,113263,,,20,100,,0.995916,0.000780841,0,0.00319611,0,3.04858e-06,0.000104022,0,0,=,,,,not computed
+gpu0,wide,TP,100,1566,221.579326,16877.3,,,20,100,,0.997254,0,0,0.00271736,0,9.85222e-06,1.82977e-05,2.11818e-07,0,=,,,,not computed
+gpu0,wide,TP,100,1656,214.168792,16267.6,,,20,100,,0.991276,0,0,8.92414e-05,0,0.00789761,0.000737283,0,0,=,,,,not computed
+gpu0,wide,TP,100,1732,266.082779,56613.6,,,20,100,,0.944062,0.00583791,0,0.0380649,0.0119365,3.88641e-07,1.42343e-05,8.36763e-05,0,=,,,,not computed
+gpu0,wide,TP,100,1788,337.402451,756090,,,20,100,,0.966669,0.000875669,0,0.027575,0,5.23387e-06,0.00487483,4.62718e-07,0,=,,,,not computed
+gpu0,wide,TP,100,1823,288.009364,54011.4,,,20,100,,1,0,0,0,0,2.35466e-08,6.94373e-08,0,0,=,,,,not computed
+gpu0,wide,TP,100,1827,349.266040,62540.3,,,20,100,,0.96208,0.0378256,0,8.58889e-05,0,1.96357e-07,8.22711e-06,0,0,=,,,,not computed
+gpu0,wide,TP,100,1842,341.069676,313015,,,20,100,,0.997692,0.00223587,0,6.78336e-05,0,3.61486e-06,1.79691e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,1951,321.522150,146899,,,20,100,,0.953832,0.0379932,0,0.000286905,0,0,0.00788803,3.79027e-07,0,=,,,,not computed
+gpu0,wide,TP,100,1990,274.935898,20203.7,,,20,100,,0.999941,6.55003e-07,0,4.94907e-05,0,8.97645e-06,2.54694e-08,0,0,=,,,,not computed
+gpu0,wide,TP,100,2086,324.426290,87310.6,,,20,100,,0.988072,0.011895,0,3.08509e-05,0,0,2.6039e-06,0,0,=,,,,not computed
+gpu0,wide,TP,100,2140,314.473207,30423.2,,,20,100,,0.979431,0.000206369,0,0.0197295,0,1.96701e-07,0.000632622,0,0,=,,,,not computed
+gpu0,wide,TP,100,2174,341.567568,567283,,,20,100,,0.999818,7.5675e-05,0,9.48014e-05,0,1.31843e-08,1.17871e-06,1.02132e-05,0,=,,,,not computed
+gpu0,wide,TP,100,2270,105.783191,241672,,,20,100,,0.978052,6.68816e-19,1.74438e-19,0.0193633,0.0025684,0,4.91793e-19,0,1.65135e-05,=,,,,not computed
+gpu0,wide,TP,100,2281,274.118915,56310.6,,,20,100,,0.993441,0.00649034,0,5.10192e-05,0,0,1.75659e-05,0,0,=,,,,not computed
+gpu0,wide,TP,100,2289,337.267371,13296.3,,,20,100,,0.999965,0,0,0,3.6117e-06,0,0,0,3.12125e-05,=,,,,not computed
+gpu0,wide,TP,100,2333,263.380770,80371.9,,,20,100,,0.994491,0.000308367,0,0,0,3.20745e-06,0.00390419,0.00129276,0,=,,,,not computed
+gpu0,wide,TP,100,2341,327.412573,216061,,,20,100,,0.999616,6.03896e-05,0,0,0,0.000287179,3.67656e-05,3.83858e-08,0,=,,,,not computed
+gpu0,wide,TP,100,2351,313.531940,27953.9,,,20,100,,0.992326,0.00210521,0,2.26147e-05,0,0.00554546,3.62389e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,2447,100.112503,443593,,,20,100,,0.996909,1.30352e-20,3.76992e-21,0.00254658,0.000465367,0,7.44992e-20,7.86641e-05,4.38836e-07,=,,,,not computed
+gpu0,wide,TP,100,2495,342.003482,14774.2,,,20,100,,0.999891,6.12907e-05,0,0,0,0,1.24272e-06,0,4.65772e-05,=,,,,not computed
+gpu0,wide,TP,100,2513,345.083650,30292.7,,,20,100,,0.993824,0.00448086,0,0.000691141,0,0,0.00100351,0,0,=,,,,not computed
+gpu0,wide,TP,100,2541,238.948937,41715.8,,,20,100,,0.997141,0.000583903,0,1.86211e-05,0.00222433,4.52044e-06,2.58953e-05,1.77212e-06,0,=,,,,not computed
+gpu0,wide,TP,100,2556,100.478136,9.52723e+06,,,20,100,,0.982336,7.48905e-22,3.30344e-33,0.00119208,0.0122826,0,0,3.12476e-08,0.00418924,=,,,,not computed
+gpu0,wide,TP,100,2595,343.545739,109624,,,20,100,,0.994073,0.00277879,0,0.000119944,0,0,7.10259e-06,0.00302084,0,=,,,,not computed
+gpu0,wide,TP,100,2647,322.178226,67535.3,,,20,100,,0.998281,0.00015815,0,0,0,1.3091e-06,7.33124e-05,0.00145243,3.33849e-05,=,,,,not computed
+gpu0,wide,TP,100,2651,267.748318,160619,,,20,100,,0.974778,0.000260218,0,0.024923,0,3.83931e-05,2.21031e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,2725,338.339694,295120,,,20,100,,0.999619,0.000302202,0,7.58029e-05,0,1.65254e-06,1.26649e-06,0,0,=,,,,not computed
+gpu0,wide,TP,100,2760,210.545639,12794.2,,,20,100,,0.991798,5.84464e-05,0,0,1.72755e-05,0.00812597,7.57295e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,2770,267.870154,28369.1,,,20,100,,0.99611,0.00337771,0,0.000178103,0,0.000334529,3.79839e-08,0,0,=,,,,not computed
+gpu0,wide,TP,100,2830,301.662959,46357.2,,,20,100,,0.981711,0.0103183,0,0.00474352,0,5.23063e-06,7.02487e-08,0.00322145,0,=,,,,not computed
+gpu0,wide,TP,100,2851,297.212934,52841.8,,,20,100,,0.999995,0,0,0,0,4.7688e-06,5.00125e-08,0,5.4857e-07,=,,,,not computed
+gpu0,wide,TP,100,2900,315.300972,18982.6,,,20,100,,0.991427,0.000500406,0,0.00017643,0,0,0.0078959,0,0,=,,,,not computed
+gpu0,wide,TP,100,2923,348.829885,12003.7,,,20,100,,0.996327,0,0.0031833,0.000253331,0.000195173,0,0,4.12866e-05,0,=,,,,not computed
+gpu0,wide,TP,100,2965,335.634093,12586.6,,,20,100,,0.997109,0,0.00282429,6.57128e-05,2.92155e-07,0,0,9.14484e-07,0,=,,,,not computed
+gpu0,wide,TP,100,2983,316.345431,324297,,,20,100,,0.999267,0.000524978,0,0.000208059,0,0,1.29213e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,3039,332.762648,24761.1,,,20,100,,0.999796,3.49041e-05,0,0.000115275,0,0,5.36085e-05,4.63325e-08,0,=,,,,not computed
+gpu0,wide,TP,100,3073,324.500289,57761.9,,,20,100,,0.998214,5.42762e-05,0,3.63351e-05,0,0,0.00169543,8.80208e-08,0,=,,,,not computed
+gpu0,wide,TP,100,3097,242.764382,30841.9,,,20,100,,0.993851,1.40756e-08,0,0.000189922,0,1.49323e-07,0.00595845,3.0225e-08,0,=,,,,not computed
+gpu0,wide,TP,100,3102,324.464752,11063.2,,,20,100,,0.986176,0.00248526,0,0,0,0.00353381,0.00780519,0,1.27339e-07,=,,,,not computed
+gpu0,wide,TP,100,3166,302.677857,45582.7,,,20,100,,0.952892,0.0393989,0,0.00770817,0,0,1.02019e-06,0,0,=,,,,not computed
+gpu0,wide,TP,100,3183,309.653496,661787,,,20,100,,0.991774,0.00810031,0,0,0,0,0.000126012,0,0,=,,,,not computed
+gpu0,wide,TP,100,3207,244.248082,40391,,,20,100,,0.999983,5.36371e-07,0,0,0,1.62004e-05,5.95196e-08,0,0,=,,,,not computed
+gpu0,wide,TP,100,3317,267.070696,29722.1,,,20,100,,0.999967,1.48155e-05,0,0,0,0,1.77102e-05,0,0,=,,,,not computed
+gpu0,wide,TP,100,3398,275.042737,239623,,,20,100,,0.999681,0.000181446,0,2.21366e-05,0,0.000115472,2.48959e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,3446,322.162057,28483.3,,,20,100,,0.951997,0.00198887,0,0.0460145,0,0,1.17661e-08,0,0,=,,,,not computed
+gpu0,wide,TP,100,3487,339.990234,791078,,,20,100,,0.999459,0.000541153,0,0,0,0,1.18e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,3514,224.285548,15197.3,,,20,100,,0.999623,8.30542e-05,0,0.000239289,0,5.50712e-05,1.28353e-08,0,0,=,,,,not computed
+gpu0,wide,TP,100,3525,298.668743,147072,,,20,100,,0.992663,0.0070864,0,0.000235869,0,0,1.43937e-05,0,0,=,,,,not computed
+gpu0,wide,TP,100,3589,100.971041,5.17594e+06,,,20,100,,0.987468,1.89611e-21,8.04359e-23,0.0123082,0.00014623,1.78924e-06,3.63474e-19,2.01657e-08,7.56933e-05,=,,,,not computed
+gpu0,wide,TP,100,3630,297.961095,27761.3,,,20,100,,0.987387,0.0126131,0,0,0,0,0,0,2.39404e-08,=,,,,not computed
+gpu0,wide,TP,100,3678,309.077435,701588,,,20,100,,0.985815,0.00193392,0,0.0114535,0,0.000797722,4.72018e-08,0,0,=,,,,not computed
+gpu0,wide,TP,100,3694,341.388983,693962,,,20,100,,0.990682,1.4197e-07,0,0.00136331,0,4.50942e-07,0.000163322,0.00779095,0,=,,,,not computed
+gpu0,wide,TP,100,3719,328.545347,12218.5,,,20,100,,0.990298,0,0,0.00957131,0,0,4.33724e-07,0.000130022,0,=,,,,not computed
+gpu0,wide,TP,100,3743,318.910455,199295,,,20,100,,0.956382,0.0416787,0,0,0,0,0,0.00174774,0.000192019,=,,,,not computed
+gpu0,wide,TP,100,3750,103.097374,420931,,,20,100,,0.906332,7.89988e-20,7.66781e-21,0.0436988,0.0411791,0,1.15313e-18,0.00822348,0.00056649,=,,,,not computed
+gpu0,wide,TP,100,3751,328.896629,105979,,,20,100,,0.975836,0.023766,0,1.48785e-05,0,0,0.000383104,1.0987e-07,0,=,,,,not computed
+gpu0,wide,TP,100,3824,304.468248,312984,,,20,100,,0.999275,0.000643836,0,5.47915e-05,0,5.89311e-08,2.55606e-05,6.26023e-07,0,=,,,,not computed
+gpu0,wide,TP,100,3906,277.588505,20459.9,,,20,100,,0.990582,0.000310646,0,0.00907982,0,0,6.26808e-08,2.79165e-05,0,=,,,,not computed
+gpu0,wide,TP,100,3917,343.581397,1.17697e+06,,,20,100,,0.996938,0.00183746,0,0,0,1.97466e-07,0.00122434,0,0,=,,,,not computed
+gpu0,wide,TP,100,3920,343.671611,580817,,,20,100,,0.974276,6.27679e-05,0,0.0246274,0,0.000648993,8.47541e-06,0.000376215,0,=,,,,not computed
+gpu0,wide,TP,100,4023,285.782864,91334.1,,,20,100,,0.987383,0.011805,0,0.000797876,0,0,1.36961e-05,0,0,=,,,,not computed
+gpu0,wide,TP,100,4038,323.757098,11095.2,,,20,100,,0.996802,0,0,1.71924e-05,7.13117e-08,0.0031804,0,0,0,=,,,,not computed
+gpu0,wide,TP,100,4046,285.149345,79201.3,,,20,100,,0.99919,0.000800401,0,0,0,9.83083e-08,9.64598e-07,8.73802e-06,0,=,,,,not computed
+gpu0,wide,TP,100,4109,303.555139,21854.4,,,20,100,,0.999469,0.000376654,0,0,0,0,1.0305e-08,0.000154609,2.12281e-08,=,,,,not computed
+gpu0,wide,TP,100,4117,285.997693,35626,,,20,100,,0.997197,0.000635589,0,0,0,0,1.45693e-05,1.32881e-05,0.00213957,=,,,,not computed
+gpu0,wide,TP,100,4145,325.877321,848806,,,20,100,,0.997741,0.000730263,0,0.00152844,0,0,4.95168e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,4197,262.663801,28872.3,,,20,100,,0.976485,4.63761e-06,0,0.0235096,0,2.88537e-07,2.31948e-07,4.15475e-07,0,=,,,,not computed
+gpu0,wide,TP,100,4212,315.979849,40307.3,,,20,100,,0.954251,0.0456239,0,0,0,0,2.38765e-05,0,0.000101054,=,,,,not computed
+gpu0,wide,TP,100,4287,290.419926,16717,,,20,100,,0.997085,4.6871e-05,0,0,0,0.00114711,7.1675e-06,0.00110185,0.000611962,=,,,,not computed
+gpu0,wide,TP,100,4319,264.942646,14080.3,,,20,100,,0.993902,0.00286068,0,0.00020205,0,0.00300153,1.11821e-08,3.40159e-05,0,=,,,,not computed
+gpu0,wide,TP,100,4339,338.846237,16433.2,,,20,100,,0.992787,0.000114542,0,0,0,0,1.33788e-07,0,0.00709807,=,,,,not computed
+gpu0,wide,TP,100,4358,336.607156,12678.1,,,20,100,,0.998641,0,0,0,0.00135928,0,0,0,0,=,,,,not computed
+gpu0,wide,TP,100,4367,348.982593,1.294e+06,,,20,100,,0.999906,1.9544e-05,0,0,0,7.4475e-05,2.9438e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,4441,313.004390,24934.7,,,20,100,,0.957632,0.0417002,0,0.000642718,0,0,2.50448e-05,1.96603e-07,0,=,,,,not computed
+gpu0,wide,TP,100,4462,327.960960,91796.1,,,20,100,,0.974384,0.0256157,0,0,0,0,5.58239e-07,0,0,=,,,,not computed
+gpu0,wide,TP,100,4510,334.219218,11245.8,,,20,100,,0.986433,0.00508215,0,0.000187461,0,0,2.69497e-07,0.00829698,0,=,,,,not computed
+gpu0,wide,TP,100,4563,347.266983,132954,,,20,100,,0.990467,0.00951889,0,0,0,0,1.87995e-08,1.35487e-05,7.61312e-07,=,,,,not computed
+gpu0,wide,TP,100,4592,249.531913,14630.9,,,20,100,,0.996092,0.00350441,0,0.000403496,0,0,3.00259e-07,3.34782e-08,0,=,,,,not computed
+gpu0,wide,TP,100,4653,343.869118,49696.8,,,20,100,,0.998857,5.48661e-05,0,2.08349e-05,0,0.000556228,0.000510959,1.33048e-07,0,=,,,,not computed
+gpu0,wide,TP,100,4762,298.014373,188888,,,20,100,,0.983062,0.00389304,0,0.00509541,0,1.69963e-06,0.00794715,1.0363e-06,0,=,,,,not computed
+gpu0,wide,TP,100,4835,338.105172,51745.3,,,20,100,,0.994614,0.000572221,0,0.00202118,0,0.00279116,9.18624e-07,5.9961e-07,0,=,,,,not computed
+gpu0,wide,TP,100,4868,282.856930,29346.8,,,20,100,,0.996416,0.000364344,0,0.00321867,0,0,9.62648e-08,1.22646e-06,0,=,,,,not computed
+gpu0,wide,TP,100,4886,335.749256,15888.8,,,20,100,,0.989945,0.00756502,0,0,0,2.67188e-07,2.37901e-07,0.00237288,0.000116393,=,,,,not computed
+gpu0,wide,TP,100,4966,300.916709,79955.8,,,20,100,,0.969756,3.69327e-05,0,0.027882,0,0,0.00232431,5.70697e-07,0,=,,,,not computed
+gpu0,wide,TP,100,4995,295.743428,88160.5,,,20,100,,0.986312,9.13896e-05,0,0.0135803,0,0,2.8292e-08,1.61191e-05,0,=,,,,not computed
+gpu0,wide,TP,100,5000,104.186172,1.94675e+06,,,20,100,,0.952024,3.34303e-20,3.00734e-32,0.0374229,3.10155e-06,0.00333276,0,0,0.00721715,=,,,,not computed
+gpu0,wide,UVkkt,100,3589,100.971041,5.17594e+06,15.4859,-2.55136e+07,20,100,101.677806,6087.82,1.78233e-17,8.14879e-19,75.8808,0.901522,0.0110308,5.12162e-19,0.000124323,0.466656,=,,,,not computed
+gpu0,cold,TP,100,15,101.174559,1.43367e+06,,,20,100,,0.993884,7.74701e-21,1.8441e-32,0.0056043,1.37673e-05,0,0,8.69276e-08,0.000497433,=,,,,not computed
+gpu0,cold,TP,100,18,105.124473,8.11149e+06,,,20,100,,0.982744,1.35968e-20,2.31759e-21,0.00116473,0.0158324,2.61037e-07,4.93404e-20,0,0.000259052,=,,,,not computed
+gpu0,cold,TP,100,28,108.127055,1.0517e+06,,,20,100,,0.952734,5.48822e-19,5.83088e-20,0.042613,0.00176884,0,1.27162e-18,2.00886e-07,0.00288396,=,,,,not computed
+gpu0,cold,TP,100,54,107.418325,9.51111e+06,,,20,100,,0.98337,4.13822e-20,1.33643e-31,0.00873824,0.000372428,0.00423646,0,1.71706e-07,0.00328235,20,100,,0.98337|4.13822e-20|1.33643e-31|0.00873824|0.000372428|0.00423646|0|1.71706e-07|0.00328235,not computed
+gpu0,cold,TP,100,64,103.046841,194861,,,20,100,,0.980423,1.72799e-19,5.11495e-20,0.0104726,0.00885757,0,2.20037e-19,0,0.000246423,=,,,,not computed
+gpu0,cold,TP,100,73,105.373632,2.83145e+06,,,20,100,,0.99578,4.54175e-20,1.15147e-20,0.00160899,0.00260848,1.66873e-06,2.71876e-20,0,3.70983e-07,=,,,,not computed
+gpu0,cold,TP,100,84,108.123266,5.8847e+06,,,20,100,,0.965769,9.78653e-20,2.01768e-31,0.0293591,0.00233741,3.23497e-06,0,0,0.00253082,20,100,,0.965769|9.78653e-20|2.01768e-31|0.0293591|0.00233741|3.23497e-06|0|0|0.00253082,not computed
+gpu0,cold,TP,100,91,105.540042,1.85929e+06,,,2,1,,0.9935,0.00385011,0,0.00258611,1.82408e-07,4.14775e-05,2.20963e-05,1.3405e-07,1.89451e-07,20,100,,0.993522|7.58147e-20|1.90994e-20|0.00256407|0.00385037|4.14784e-05|6.89539e-20|1.34053e-07|2.22862e-05,ref 101 T=105.540042; dev not computed (not converged)
+gpu0,cold,TP,100,130,106.349810,2.20256e+06,,,20,100,,0.992029,1.00006e-19,3.24608e-20,0.00153203,0.00418207,0.00211207,1.70368e-20,0,0.000144501,=,,,,not computed
+gpu0,cold,TP,100,135,101.313122,3.72155e+06,,,20,100,,0.994687,3.23106e-21,2.14103e-21,7.53182e-05,0.00522623,0,1.21007e-21,0,1.11413e-05,=,,,,not computed
+gpu0,cold,TP,100,137,103.386023,748969,,,20,100,,0.997641,5.52718e-20,2.20798e-20,0.00162181,0.000549613,0.00018766,1.84766e-20,0,1.69658e-07,=,,,,not computed
+gpu0,cold,TP,100,165,100.440548,3.70314e+06,,,20,100,,0.978779,1.90243e-21,8.08755e-23,0.0151208,0.00591481,0,4.38951e-19,0,0.000185257,=,,,,not computed
+gpu0,cold,TP,100,185,101.373502,4.83939e+06,,,20,100,,0.997735,2.59079e-21,2.79623e-22,0.0022242,3.28874e-05,1.54676e-06,7.78728e-20,0,6.62907e-06,=,,,,not computed
+gpu0,cold,TP,100,219,107.588708,844727,,,20,100,,0.989839,5.14553e-19,1.21173e-19,0.00976337,0.000339326,0,2.29087e-19,0,5.83554e-05,=,,,,not computed
+gpu0,cold,TP,100,245,104.398585,1.28634e+06,,,20,100,,0.97877,5.71687e-20,7.30285e-21,0.0113234,0.009245,0.00038809,2.34464e-19,0.000228603,4.48699e-05,=,,,,not computed
+gpu0,cold,TP,100,297,100.742165,252528,,,20,100,,0.94075,3.2619e-20,4.24923e-21,0.0245421,0.0346934,0,7.47918e-19,0,1.40638e-05,=,,,,not computed
+gpu0,cold,TP,100,324,104.751600,3.12896e+06,,,20,100,,0.977525,2.84045e-20,7.05095e-21,0.00131146,0.0199201,1.67979e-06,2.77953e-20,0,0.00124187,=,,,,not computed
+gpu0,cold,TP,100,328,101.327258,2.85643e+06,,,20,100,,0.989644,4.26801e-21,2.77146e-22,0.0103041,5.15565e-05,0,3.77674e-19,0,7.55413e-08,=,,,,not computed
+gpu0,cold,TP,100,420,107.304038,967419,,,20,100,,0.945053,3.7352e-19,5.04552e-20,0.0237444,0.0311989,6.26585e-08,5.68074e-19,3.72149e-06,1.62158e-08,=,,,,not computed
+gpu0,cold,TP,100,448,101.032606,3.57862e+06,,,20,100,,0.985938,2.81662e-21,4.61871e-33,0.00302452,0.00936892,0.000459389,0,0,0.00120916,20,100,,0.985938|2.81662e-21|4.61871e-33|0.00302452|0.00936892|0.000459389|0|0|0.00120916,not computed
+gpu0,cold,TP,100,459,101.849840,5.12884e+06,,,20,100,,0.968951,3.16705e-21,2.88953e-22,0.00317069,0.0278378,0,6.31659e-20,9.0602e-08,4.07328e-05,=,,,,not computed
+gpu0,cold,TP,100,488,101.961590,832631,,,20,100,,0.956901,2.12375e-20,1.52674e-21,0.0328214,0.00670393,0.00342213,9.70391e-19,0.00015003,1.45408e-06,=,,,,not computed
+gpu0,cold,TP,100,491,107.991831,429613,,,20,100,,0.957152,1.24955e-18,2.17833e-19,0.0377224,0.000659357,0.00443909,1.03974e-18,2.7655e-05,1.66744e-08,=,,,,not computed
+gpu0,cold,TP,100,501,105.303365,5.59599e+06,,,20,100,,0.97737,2.16531e-20,1.12707e-20,0.000186603,0.0224026,0,7.85701e-22,2.02623e-08,4.08125e-05,20,100,,0.97737|2.16531e-20|1.12707e-20|0.000186603|0.0224026|0|7.85701e-22|2.02623e-08|4.08125e-05,not computed
+gpu0,cold,TP,100,522,108.256132,265492,,,20,100,,0.952971,2.30664e-18,5.58128e-19,0.0330573,0.0139361,2.47467e-06,1.31488e-18,0,3.26483e-05,=,,,,not computed
+gpu0,cold,TP,100,528,101.494884,68552.8,,,20,100,,0.973738,1.92249e-19,1.51579e-19,0.0029518,0.0232882,0,2.94507e-20,1.45688e-05,7.8653e-06,=,,,,not computed
+gpu0,cold,TP,100,534,100.390993,2.95562e+06,,,20,100,,0.992145,2.32003e-21,1.85622e-22,0.00530808,0.00209706,0,2.00914e-19,0,0.000450165,=,,,,not computed
+gpu0,cold,TP,100,557,100.427555,3.85237e+06,,,20,100,,0.989594,1.82516e-21,9.21126e-23,0.0103456,6.00666e-05,4.20392e-07,4.52019e-19,0,3.4578e-07,=,,,,not computed
+gpu0,cold,TP,100,584,107.409397,380083,,,20,100,,0.977219,1.02331e-18,3.89338e-19,0.00790895,0.0147945,0,1.64759e-19,7.75511e-05,3.75812e-08,=,,,,not computed
+gpu0,cold,TP,100,592,106.810175,6.51297e+06,,,20,100,,0.993196,4.36407e-20,6.03832e-21,0.00313482,0.003654,0,6.83907e-20,0,1.48076e-05,=,,,,not computed
+gpu0,cold,TP,100,607,103.556910,158932,,,20,100,,0.947769,2.84641e-19,4.97479e-20,0.0409666,0.0100906,0,1.68711e-18,1.27628e-05,0.0011607,=,,,,not computed
+gpu0,cold,TP,100,642,100.757488,39047,,,20,100,,0.941231,2.1176e-19,8.0337e-20,0.0186736,0.0308961,2.16146e-06,7.58832e-19,0.00511006,0.00408715,=,,,,not computed
+gpu0,cold,TP,100,678,106.325499,3.83812e+06,,,20,100,,0.990631,5.67323e-20,7.88831e-21,0.00477666,0.00262792,0,1.09466e-19,1.00173e-08,0.00196444,=,,,,not computed
+gpu0,cold,TP,100,682,108.463898,1.73261e+06,,,20,100,,0.94455,3.95752e-19,3.30482e-20,0.0444025,0.00977268,0,1.11669e-18,0,0.00127494,0,78,,0.94455|3.95752e-19|2.08203e-30|0.0444025|0.00977268|0|0|0|0.00127494,ref 101 T=108.463898; head dev abs=6.9e-18 rel=3.0e-12
+gpu0,cold,TP,100,701,102.158559,7.59518e+06,,,20,100,,0.957357,2.53383e-21,8.05348e-22,0.000185905,0.0424566,0,3.33101e-21,4.03378e-07,6.00045e-08,=,,,,not computed
+gpu0,cold,TP,100,739,102.465342,8.78936e+06,,,20,100,,0.986065,2.73326e-21,1.16466e-22,0.00993731,0.00332283,0,3.65465e-19,1.45163e-06,0.000673555,=,,,,not computed
+gpu0,cold,TP,100,787,109.136455,1.15982e+06,,,20,100,,0.993175,8.5083e-19,2.46265e-19,0.00634851,0.000424328,0,6.31385e-20,2.47291e-06,4.92794e-05,=,,,,not computed
+gpu0,cold,TP,100,795,103.533733,25262,,,20,100,,0.956359,1.77878e-18,7.99365e-19,0.0390545,0.00446345,0,5.73997e-19,0,0.00012345,=,,,,not computed
+gpu0,cold,TP,100,848,106.880338,222929,,,20,100,,0.980919,1.3239e-18,4.58295e-19,0.0148287,0.00366468,0,9.09126e-20,0,0.000587991,=,,,,not computed
+gpu0,cold,TP,100,853,104.906674,2.26785e+06,,,20,100,,0.989537,4.35683e-20,5.56803e-21,0.00717767,0.00316939,0,1.7632e-19,5.18804e-07,0.00011523,=,,,,not computed
+gpu0,cold,TP,100,875,102.887649,27048.7,,,20,100,,0.962638,1.1208e-18,6.85181e-19,0.0168986,0.0204632,0,2.37935e-19,0,1.03108e-08,=,,,,not computed
+gpu0,cold,TP,100,885,102.211197,5.06777e+06,,,20,100,,0.998141,4.09063e-21,5.85282e-22,0.00145182,0.000399786,8.65027e-08,4.25465e-20,0,7.14561e-06,=,,,,not computed
+gpu0,cold,TP,100,895,102.462867,2.83415e+06,,,20,100,,0.996405,8.49346e-21,1.15044e-21,0.00305882,0.000367184,0,5.80264e-20,0.00014872,1.984e-05,0,90,,0.996405|8.49347e-21|3.32272e-32|0.00305882|0.000367184|0|0|0.00014872|1.984e-05,ref 101 T=102.462867; head dev abs=4.3e-19 rel=9.8e-07
+gpu0,cold,TP,100,903,101.430311,2.88479e+06,,,20,100,,0.987993,4.49441e-21,2.82774e-22,0.0111091,0.000488459,7.72251e-07,3.71844e-19,1.31476e-05,0.00039586,=,,,,not computed
+gpu0,cold,TP,100,916,109.278676,5.4393e+06,,,20,100,,0.939009,1.8467e-19,2.57479e-20,0.00566492,0.0380722,0.00502625,1.51932e-19,0,0.0122277,=,,,,not computed
+gpu0,cold,TP,100,924,109.226157,2.2203e+06,,,20,100,,0.952213,4.54896e-19,4.87628e-20,0.0240213,0.0168994,0,4.22176e-19,0.00155156,0.00531483,=,,,,not computed
+gpu0,cold,TP,100,965,100.428833,1.37332e+06,,,20,100,,0.957627,5.12116e-21,2.15369e-22,0.041784,3.15871e-05,3.09048e-07,1.36811e-18,0.000528827,2.78616e-05,=,,,,not computed
+gpu0,cold,TP,100,1031,104.271705,1.0348e+06,,,20,100,,0.959596,6.67521e-20,4.99351e-21,0.0403711,3.28425e-05,0,1.56886e-18,0,3.14234e-07,=,,,,not computed
+gpu0,cold,TP,100,1095,109.623721,8.80271e+06,,,20,100,,0.952779,1.43897e-19,6.06641e-21,0.0430883,0.00410404,0,1.52268e-18,0,2.87252e-05,=,,,,not computed
+gpu0,cold,TP,100,1135,103.479087,3.39929e+06,,,20,100,,0.950434,1.22635e-20,1.72495e-21,0.00280436,0.0467615,0,8.39815e-20,4.70783e-08,2.48788e-07,=,,,,not computed
+gpu0,cold,TP,100,1152,106.029175,256361,,,20,100,,0.983926,7.1654e-19,3.63925e-19,0.00501652,0.00161682,0,3.19563e-20,0.00812042,0.00132058,=,,,,not computed
+gpu0,cold,TP,100,1179,108.772277,2.58052e+06,,,20,100,,0.978874,3.11028e-19,6.51098e-20,0.0050083,0.00915338,2.03593e-08,8.49049e-20,0.0069638,1.76051e-07,=,,,,not computed
+gpu0,cold,TP,100,1232,104.688378,33401.4,,,20,100,,0.972854,2.59667e-18,1.71834e-18,0.0172591,0.00980802,0,4.53658e-21,0,7.90376e-05,=,,,,not computed
+gpu0,cold,TP,100,1238,103.366037,1.66909e+06,,,20,100,,0.975551,2.39435e-20,1.25226e-20,0.00041291,0.0207794,0,3.95408e-21,0.00309767,0.000158964,20,100,,0.975551|2.39435e-20|1.25226e-20|0.00041291|0.0207794|0|3.95408e-21|0.00309767|0.000158964,not computed
+gpu0,cold,TP,100,1274,101.724902,139411,,,20,100,,0.989091,1.10613e-19,4.54408e-20,0.00572881,0.00215385,0,1.45424e-19,2.44276e-08,0.00302641,20,100,,0.989091|1.10613e-19|4.54408e-20|0.00572881|0.00215385|0|1.45424e-19|2.44276e-08|0.00302641,not computed
+gpu0,cold,TP,100,1280,100.114341,862117,,,20,100,,0.989051,6.69588e-21,8.03481e-22,0.00759325,0.000162492,0,1.51433e-19,0.00302066,0.000173001,=,,,,not computed
+gpu0,cold,TP,100,1376,100.826474,230466,,,20,100,,0.958268,3.87583e-20,4.48354e-21,0.035787,0.00545468,0.000393149,1.13817e-18,0,9.69068e-05,=,,,,not computed
+gpu0,cold,TP,100,1385,100.960364,897621,,,20,100,,0.963219,1.04819e-20,2.97096e-21,0.00153048,0.0337997,0,3.81513e-20,2.81989e-07,0.00145011,=,,,,not computed
+gpu0,cold,TP,100,1401,103.895489,102428,,,20,100,,0.945448,5.26643e-19,1.54224e-19,0.0238411,0.0306982,1.42216e-07,6.11265e-19,1.24847e-05,5.53433e-07,=,,,,not computed
+gpu0,cold,TP,100,1447,103.665026,64314.7,,,20,100,,0.952343,7.45579e-19,2.33838e-19,0.0320224,0.0156108,0,9.74976e-19,0,2.41065e-05,=,,,,not computed
+gpu0,cold,TP,100,1538,100.984246,100142,,,20,100,,0.985305,9.84942e-20,3.11779e-20,0.011424,0.00325977,0,2.52491e-19,0,1.16092e-05,=,,,,not computed
+gpu0,cold,TP,100,1566,102.949335,489239,,,20,100,,0.99775,6.55586e-20,3.03049e-20,0.00168947,0.000560529,0,2.00325e-20,0,2.70472e-08,=,,,,not computed
+gpu0,cold,TP,100,1624,105.694348,4.32712e+06,,,20,100,,0.958495,3.46315e-20,2.5386e-21,0.0130978,0.0187617,0.000324628,2.92247e-19,0,0.00932082,=,,,,not computed
+gpu0,cold,TP,100,1652,101.322708,2.19236e+06,,,20,100,,0.949087,5.51543e-21,3.91681e-35,0.0454431,0.00355246,2.68954e-06,0,0,0.00191523,=,,,,not computed
+gpu0,cold,TP,100,1679,100.362055,27418.7,,,20,100,,0.988147,2.46266e-19,1.37062e-19,0.0117767,6.14742e-05,0,1.97795e-19,0,1.52307e-05,=,,,,not computed
+gpu0,cold,TP,100,1681,101.428130,5.15525e+06,,,20,100,,0.972192,2.5008e-21,8.23476e-23,0.0225861,0.00130734,0.00380771,5.04627e-19,0,0.000106928,=,,,,not computed
+gpu0,cold,TP,100,1709,103.492408,8.58577e+06,,,20,100,,0.993798,5.12317e-21,7.41896e-33,0.00426122,2.97691e-05,1.43072e-08,0,1.38353e-05,0.00189688,=,,,,not computed
+gpu0,cold,TP,100,1723,103.909697,9.48275e+06,,,20,100,,0.993558,5.91097e-21,7.18779e-33,0.00541929,2.21185e-05,4.61955e-05,0,0,0.000954715,20,100,,0.993558|5.91097e-21|7.18779e-33|0.00541929|2.21185e-05|4.61955e-05|0|0|0.000954715,not computed
+gpu0,cold,TP,100,1732,101.736646,1.19175e+06,,,20,100,,0.999413,1.30948e-20,8.63982e-21,0.000261747,0.00019275,5.70323e-07,3.00706e-21,6.58164e-08,0.000131424,=,,,,not computed
+gpu0,cold,TP,100,1739,101.440292,5.25391e+06,,,20,100,,0.964147,2.48276e-21,6.53065e-23,0.0349758,0.000864022,0,1.09051e-18,0,1.31982e-05,=,,,,not computed
+gpu0,cold,TP,100,1741,100.898622,2.0257e+06,,,20,100,,0.986876,4.59642e-21,5.06227e-22,0.00455271,0.000151392,0,1.55613e-19,1.5695e-08,0.0084199,=,,,,not computed
+gpu0,cold,TP,100,1809,100.749828,1.83793e+06,,,20,100,,0.996871,4.65919e-21,8.18155e-22,0.00192347,0.000494489,0,3.31417e-20,0.000710029,7.40699e-07,=,,,,not computed
+gpu0,cold,TP,100,1815,100.334865,191367,,,20,100,,0.989914,3.45776e-20,9.69439e-21,0.006586,0.00217049,0,1.6843e-19,4.22552e-07,0.00132956,=,,,,not computed
+gpu0,cold,TP,100,1820,104.641130,231584,,,20,100,,0.985968,3.6693e-19,1.18196e-19,0.0104697,0.00355519,9.89604e-09,2.4352e-19,0,6.68126e-06,=,,,,not computed
+gpu0,cold,TP,100,1840,105.321389,733324,,,20,100,,0.992523,1.70606e-19,4.16067e-20,0.00665458,0.000664365,0.000158423,1.19287e-19,0,1.45388e-08,=,,,,not computed
+gpu0,cold,TP,100,1875,106.573378,457109,,,20,100,,0.961886,5.34754e-19,1.30704e-19,0.0133643,0.0247161,0,3.29152e-19,0,3.3523e-05,=,,,,not computed
+gpu0,cold,TP,100,1926,101.151785,2.59291e+06,,,20,100,,0.964061,4.17796e-21,1.80418e-22,0.0244042,0.0115342,0,7.29872e-19,0,5.58353e-07,=,,,,not computed
+gpu0,cold,TP,100,1998,104.838141,114938,,,20,100,,0.930925,7.94446e-19,2.27939e-19,0.0266148,0.0396387,0,7.13762e-19,0,0.00282189,=,,,,not computed
+gpu0,cold,TP,100,2030,105.410324,127238,,,20,100,,0.978964,1.02754e-18,4.11073e-19,0.0144306,0.00587072,0,1.2612e-19,3.64446e-06,0.000730933,=,,,,not computed
+gpu0,cold,TP,100,2134,107.670342,3.0586e+06,,,20,100,,0.968561,1.44154e-19,3.98542e-20,0.00193004,0.02892,0,2.86864e-20,0.00058921,9.82787e-09,=,,,,not computed
+gpu0,cold,TP,100,2145,102.247559,6.56204e+06,,,20,100,,0.994973,3.22016e-21,5.39234e-33,0.00210058,0.00158393,0,0,3.09947e-05,0.00131141,20,100,,0.994973|3.22016e-21|5.39234e-33|0.00210058|0.00158393|0|0|3.09947e-05|0.00131141,not computed
+gpu0,cold,TP,100,2153,100.985501,4.22491e+06,,,20,100,,0.997386,2.34077e-21,8.00271e-33,0.00121479,0.000912656,0,0,0.000307167,0.000179154,=,,,,not computed
+gpu0,cold,TP,100,2158,102.958684,62388.5,,,20,100,,0.979747,5.13157e-19,2.44519e-19,0.0124022,0.00782122,0,2.2495e-19,4.04088e-08,2.95047e-05,=,,,,not computed
+gpu0,cold,TP,100,2192,103.616769,139175,,,20,100,,0.985222,3.40167e-19,1.09201e-19,0.0141951,0.000564746,0,3.26197e-19,1.00108e-05,8.40725e-06,=,,,,not computed
+gpu0,cold,TP,100,2203,102.875945,6.0189e+06,,,20,100,,0.989492,5.06626e-21,5.34556e-22,0.00257547,0.00465077,1.00806e-06,6.74268e-20,0.00225616,0.00102439,=,,,,not computed
+gpu0,cold,TP,100,2204,101.309351,7.35904e+06,,,20,100,,0.996573,1.63539e-21,1.83651e-22,0.00132931,0.000506237,0,4.78409e-20,0.00116269,0.00042838,20,100,,0.996573|1.63539e-21|1.83651e-22|0.00132931|0.000506237|0|4.78409e-20|0.00116269|0.00042838,not computed
+gpu0,cold,TP,100,2214,100.649176,2.71307e+06,,,20,100,,0.994576,2.9592e-21,4.73409e-22,0.00153076,0.000786254,0.00308966,3.3364e-20,4.43138e-08,1.72233e-05,=,,,,not computed
+gpu0,cold,TP,100,2218,103.032642,1.72032e+06,,,20,100,,0.964079,1.94851e-20,1.58995e-32,0.0306121,1.46558e-05,0,0,3.04833e-07,0.00529431,=,,,,not computed
+gpu0,cold,TP,100,2266,103.582629,2.43831e+06,,,20,100,,0.977554,1.86222e-20,1.33661e-20,0.000157418,0.0222881,0,6.94968e-23,6.05922e-08,2.12578e-07,=,,,,not computed
+gpu0,cold,TP,100,2269,106.467641,681427,,,20,100,,0.951407,3.38991e-19,4.89103e-20,0.0252244,0.0229027,0,4.65016e-19,0.000205155,0.00026065,=,,,,not computed
+gpu0,cold,TP,100,2283,101.032293,295324,,,20,100,,0.964495,3.44823e-20,3.66375e-21,0.0348446,9.49733e-05,0.000114048,1.50322e-18,1.31128e-08,0.000451056,=,,,,not computed
+gpu0,cold,TP,100,2300,101.462309,7.50704e+06,,,20,100,,0.986171,1.75342e-21,7.73295e-23,0.008713,1.99065e-05,0,2.83343e-19,0.00509519,8.3089e-07,=,,,,not computed
+gpu0,cold,TP,100,2321,100.863455,155883,,,20,100,,0.960165,5.67361e-20,3.30387e-20,0.00203782,0.0335723,2.02631e-08,9.64991e-20,0.00422513,2.27803e-08,=,,,,not computed
+gpu0,cold,TP,100,2366,100.799083,5.0864e+06,,,20,100,,0.968476,1.72541e-21,5.09565e-23,0.0247046,0.00225766,0,4.5944e-19,0.000146937,0.00441439,20,100,,0.968476|1.72541e-21|5.09565e-23|0.0247046|0.00225766|0|4.59442e-19|0.000146937|0.00441439,not computed
+gpu0,cold,TP,100,2378,102.131699,736614,,,20,100,,0.965491,2.62492e-20,3.3454e-21,0.0121003,0.0186535,0.00375501,3.73772e-19,0,2.87234e-07,=,,,,not computed
+gpu0,cold,TP,100,2383,108.686598,1.98497e+06,,,20,100,,0.969965,3.86607e-19,5.44797e-20,0.0141372,0.00848414,1.26402e-07,3.08783e-19,1.62415e-05,0.0073978,=,,,,not computed
+gpu0,cold,TP,100,2399,109.081420,3.22862e+06,,,20,100,,0.987826,2.95333e-19,5.16434e-20,0.00614873,0.00318263,3.62243e-07,1.62284e-19,0.00283364,8.14587e-06,=,,,,not computed
+gpu0,cold,TP,100,2490,103.355091,231658,,,20,100,,0.990953,1.75519e-19,5.53155e-20,0.00836991,0.00041983,3.99264e-06,2.12715e-19,0.000104425,0.000148427,=,,,,not computed
+gpu0,cold,TP,100,2499,100.640047,2.56263e+06,,,20,100,,0.964901,3.03001e-21,3.07587e-22,0.00390662,0.0311908,0,1.71104e-19,1.06233e-06,1.31003e-07,=,,,,not computed
+gpu0,cold,TP,100,2516,109.151628,9.627e+06,,,20,100,,0.988859,1.03319e-19,8.02268e-21,0.0106579,0.000333382,0,2.71168e-19,2.62086e-07,0.000149444,=,,,,not computed
+gpu0,cold,TP,100,2553,102.592912,9.21374e+06,,,20,100,,0.97348,2.78385e-21,1.03893e-22,0.0125766,0.0138242,0.000107763,2.58497e-19,0,1.11959e-05,=,,,,not computed
+gpu0,cold,TP,100,2573,102.237201,6.91401e+06,,,20,100,,0.994335,3.0424e-21,3.09274e-33,0.00436586,0.000790915,5.73479e-07,0,0.000131757,0.000375641,=,,,,not computed
+gpu0,cold,TP,100,2622,107.509467,3.03859e+06,,,20,100,,0.991409,1.36999e-19,1.90986e-20,0.00762115,0.000969085,9.10612e-07,1.13832e-19,0,1.84835e-07,=,,,,not computed
+gpu0,cold,TP,100,2640,101.792353,640042,,,20,100,,0.954252,2.48384e-20,2.06564e-21,0.0305933,0.0151536,0,1.68867e-18,1.02244e-06,3.37855e-07,=,,,,not computed
+gpu0,cold,TP,100,2646,101.113456,3.06613e+06,,,20,100,,0.980368,3.48893e-21,1.58169e-22,0.0187669,0.000864718,0,4.87025e-19,0,7.29319e-07,=,,,,not computed
+gpu0,cold,TP,100,2649,102.940876,3.01892e+06,,,20,100,,0.99443,1.05398e-20,1.79931e-21,0.00199774,0.00137764,1.22022e-06,6.32207e-20,5.02677e-08,0.00219291,20,100,,0.99443|1.05398e-20|1.79931e-21|0.00199774|0.00137764|1.22022e-06|6.32208e-20|5.02677e-08|0.00219291,not computed
+gpu0,cold,TP,100,2652,109.058776,720569,,,20,100,,0.985687,1.31451e-18,3.29032e-19,0.0134574,0.000854719,7.53046e-07,2.63639e-19,0,1.22375e-08,=,,,,not computed
+gpu0,cold,TP,100,2680,100.860818,2.27953e+06,,,20,100,,0.956324,4.01784e-21,1.94888e-33,0.0417132,0.000339861,0,0,0,0.00162298,=,,,,not computed
+gpu0,cold,TP,100,2691,102.760291,1.91712e+06,,,20,100,,0.967839,1.46064e-20,3.63846e-32,0.00736989,0.000914074,0,0,1.17738e-06,0.0238759,=,,,,not computed
+gpu0,cold,TP,100,2697,103.325290,6.27021e+06,,,20,100,,0.990492,6.34587e-21,5.17259e-22,0.00457396,0.000446244,0.000584971,1.22957e-19,0.00388004,2.29405e-05,=,,,,not computed
+gpu0,cold,TP,100,2730,101.514879,110111,,,20,100,,0.989479,1.23322e-19,6.10837e-20,0.00476118,0.00575937,0,1.31969e-19,1.6567e-08,2.43663e-07,=,,,,not computed
+gpu0,cold,TP,100,2751,105.920986,573814,,,20,100,,0.984923,3.026e-19,8.25843e-20,0.00762162,0.00745541,0,1.85021e-19,3.40599e-08,1.2178e-08,=,,,,not computed
+gpu0,cold,TP,100,2768,109.216870,1.42037e+06,,,20,100,,0.991755,7.24707e-19,1.7011e-19,0.00800574,0.000156428,5.62145e-07,2.09921e-19,0,8.18995e-05,=,,,,not computed
+gpu0,cold,TP,100,2821,106.485500,5.71352e+06,,,2,1,,0.970959,0.0272374,0,0.00180386,0,1.27015e-08,1.38524e-08,0,9.17153e-08,20,100,,0.970959|4.06664e-20|7.57584e-21|0.00180385|0.0272374|1.27015e-08|3.68595e-20|0|1.05568e-07,ref 101 T=106.485500; dev not computed (not converged)
+gpu0,cold,TP,100,2836,102.219034,93755.8,,,20,100,,0.98191,2.18742e-19,1.78923e-19,0.00236837,0.00656909,0,1.05805e-20,0.00913334,1.90973e-05,=,,,,not computed
+gpu0,cold,TP,100,2897,101.326947,97540.4,,,20,100,,0.960593,1.24771e-19,2.28672e-20,0.0378196,0.00152236,0,1.43659e-18,0,6.48956e-05,=,,,,not computed
+gpu0,cold,TP,100,2899,100.667070,398745,,,20,100,,0.970593,1.98699e-20,7.84561e-21,0.00167556,0.0276032,0,4.66139e-20,1.28413e-05,0.000115182,20,100,,0.970593|1.98699e-20|7.84561e-21|0.00167556|0.0276032|0|4.66139e-20|1.28413e-05|0.000115182,not computed
+gpu0,cold,TP,100,2918,100.932787,3.49728e+06,,,20,100,,0.986804,2.70879e-21,4.68495e-22,0.00107364,0.0120472,3.25959e-06,3.22153e-20,0,7.18283e-05,=,,,,not computed
+gpu0,cold,TP,100,2956,106.714238,361645,,,20,100,,0.944154,7.3723e-19,1.18344e-19,0.040675,0.0135315,1.25067e-05,1.3862e-18,0,0.00162687,20,100,,0.944154|7.3723e-19|1.18344e-19|0.040675|0.0135315|1.25067e-05|1.3862e-18|0|0.00162687,not computed
+gpu0,cold,TP,100,3017,100.513108,6.47465e+06,,,20,100,,0.995588,1.14374e-21,7.18436e-34,0.00343696,0.000594557,0,0,8.60629e-06,0.000372123,20,100,,0.995588|1.14374e-21|7.18436e-34|0.00343696|0.000594557|0|0|8.60629e-06|0.000372123,not computed
+gpu0,cold,TP,100,3051,102.604934,4.61653e+06,,,20,100,,0.985253,5.59204e-21,2.60341e-21,0.000161609,0.0145412,0,3.55855e-21,0,4.39734e-05,20,100,,0.985253|5.59204e-21|2.60341e-21|0.000161609|0.0145412|0|3.55855e-21|0|4.39734e-05,not computed
+gpu0,cold,TP,100,3088,101.403151,296841,,,20,100,,0.942678,4.1263e-20,6.42498e-21,0.0168272,0.040038,0,7.05693e-19,0,0.000456881,=,,,,not computed
+gpu0,cold,TP,100,3095,107.050935,5.11444e+06,,,20,100,,0.973034,6.35153e-20,3.54162e-21,0.0258506,0.000239635,0,7.52418e-19,0.000556825,0.000319442,=,,,,not computed
+gpu0,cold,TP,100,3103,100.913436,1.19881e+06,,,20,100,,0.957811,7.8913e-21,3.81055e-22,0.0404275,0.000109803,0,1.38084e-18,0.00164734,3.90176e-06,0,89,,0.957811|7.89131e-21|2.76441e-33|0.0404275|0.000109803|0|0|0.00164734|3.90176e-06,ref 101 T=100.913436; head dev abs=1.1e-16 rel=6.6e-07
+gpu0,cold,TP,100,3122,102.367947,2.39066e+06,,,20,100,,0.986321,9.50482e-21,7.0596e-22,0.0117987,0.00153974,0,4.39923e-19,0,0.000340664,=,,,,not computed
+gpu0,cold,TP,100,3173,103.632565,1.2788e+06,,,20,100,,0.99388,3.73749e-20,6.15693e-21,0.00588843,0.000231561,0,2.12147e-19,0,8.42062e-08,=,,,,not computed
+gpu0,cold,TP,100,3192,101.599778,3.93574e+06,,,20,100,,0.951597,3.48407e-21,4.1432e-22,0.00225895,0.0461134,3.02914e-05,1.01885e-19,0,1.52865e-07,=,,,,not computed
+gpu0,cold,TP,100,3201,100.098742,1.29679e+06,,,20,100,,0.967143,4.40071e-21,1.12797e-33,0.0277231,0.00016998,0,0,6.418e-06,0.00495742,=,,,,not computed
+gpu0,cold,TP,100,3229,104.963768,2.20541e+06,,,20,100,,0.968396,4.52632e-20,6.07939e-21,0.00661443,0.0248012,3.36922e-05,1.88769e-19,0,0.000154804,=,,,,not computed
+gpu0,cold,TP,100,3283,101.699449,486544,,,20,100,,0.9745,3.0767e-20,2.43418e-31,0.00612184,0.0118572,3.83202e-07,0,0.00106008,0.00646068,=,,,,not computed
+gpu0,cold,TP,100,3301,101.209969,1.79448e+06,,,20,100,,0.997925,6.31651e-21,2.66206e-21,0.000378767,0.00125561,0,1.1275e-20,0,0.000440759,20,100,,0.997925|6.31651e-21|2.66206e-21|0.000378767|0.00125561|0|1.1275e-20|0|0.000440759,not computed
+gpu0,cold,TP,100,3302,101.251694,3.22871e+06,,,20,100,,0.991028,3.59459e-21,3.94901e-33,0.00556596,7.07961e-05,0,0,0.00316854,0.000166683,20,100,,0.991028|3.59459e-21|3.94901e-33|0.00556596|7.07961e-05|0|0|0.00316854|0.000166683,not computed
+gpu0,cold,TP,100,3318,102.802774,5.18938e+06,,,20,100,,0.99294,5.64562e-21,6.96965e-22,0.0021546,0.00201213,1.20097e-05,8.84049e-20,0.00210734,0.000774397,20,100,,0.99294|5.64562e-21|6.96965e-22|0.0021546|0.00201213|1.20097e-05|8.84056e-20|0.00210734|0.000774397,not computed
+gpu0,cold,TP,100,3382,100.775604,4.29682e+06,,,20,100,,0.990785,2.02425e-21,1.15743e-22,0.00780319,0.000331108,0,4.08053e-19,0.000672227,0.000408325,=,,,,not computed
+gpu0,cold,TP,100,3392,105.949216,2.61338e+06,,,20,100,,0.994906,6.78944e-20,1.27141e-20,0.00359623,0.00132936,0.000126779,5.32942e-20,6.86091e-07,4.0612e-05,=,,,,not computed
+gpu0,cold,TP,100,3412,108.267671,4.37041e+06,,,20,100,,0.998276,1.42972e-19,3.83792e-20,0.00165832,6.50373e-05,0,2.58939e-20,0,2.59074e-07,=,,,,not computed
+gpu0,cold,TP,100,3423,107.860785,252953,,,20,100,,0.97063,1.97046e-18,6.04685e-19,0.0200693,0.00928317,0,3.78332e-19,2.77592e-06,1.50283e-05,=,,,,not computed
+gpu0,cold,TP,100,3544,104.815497,7.61783e+06,,,20,100,,0.974997,1.22684e-20,5.53057e-33,0.0176982,0.00208689,0,0,2.46353e-05,0.00519327,=,,,,not computed
+gpu0,cold,TP,100,3560,104.271748,202420,,,20,100,,0.969375,3.36874e-19,8.53712e-20,0.0177525,0.0126315,2.6021e-08,8.21325e-19,0,0.000241163,=,,,,not computed
+gpu0,cold,TP,100,3564,101.934059,6.86213e+06,,,20,100,,0.979809,2.51218e-21,3.4125e-22,0.00109883,0.0122586,0.00683356,4.12013e-20,0,2.37662e-07,=,,,,not computed
+gpu0,cold,TP,100,3566,100.407884,384684,,,20,100,,0.999202,1.80529e-20,1.3098e-20,0.000498962,0.000299439,0,9.35149e-21,0,1.2228e-08,=,,,,not computed
+gpu0,cold,TP,100,3582,102.247084,9.18495e+06,,,20,100,,0.944685,2.28544e-21,4.30809e-23,0.046102,0.00899841,8.46928e-07,1.56048e-18,0,0.000213236,=,,,,not computed
+gpu0,cold,TP,100,3598,100.081505,433993,,,20,100,,0.987077,1.29184e-20,6.55582e-21,0.000829753,0.0119043,9.29804e-07,1.63028e-20,1.27698e-08,0.000188125,20,100,,0.987077|1.29184e-20|6.55582e-21|0.000829753|0.0119043|9.29804e-07|1.63028e-20|1.27698e-08|0.000188125,not computed
+gpu0,cold,TP,100,3626,103.650259,3.92658e+06,,,20,100,,0.976371,1.21905e-20,2.66419e-32,0.0146966,0.000285966,0.000202841,0,0,0.00844373,=,,,,not computed
+gpu0,cold,TP,100,3664,100.674752,2.87512e+06,,,20,100,,0.9484,2.7637e-21,1.11903e-22,0.0220962,0.0258428,5.67289e-05,8.12106e-19,0,0.00360399,20,100,,0.9484|2.7637e-21|1.11903e-22|0.0220962|0.0258428|5.67289e-05|8.12106e-19|0|0.00360399,not computed
+gpu0,cold,TP,100,3666,105.316838,822417,,,20,100,,0.994885,1.5185e-19,4.01617e-20,0.00504422,6.41935e-05,5.75942e-06,1.52093e-19,0,5.05006e-07,=,,,,not computed
+gpu0,cold,TP,100,3677,103.525721,8.34981e+06,,,20,100,,0.965796,5.37917e-21,1.02599e-33,0.0338022,0.000318154,0,0,3.20184e-07,8.35014e-05,=,,,,not computed
+gpu0,cold,TP,100,3703,101.737234,9.1579e+06,,,20,100,,0.973478,1.66965e-21,8.45956e-23,0.00565814,0.0208594,2.75346e-07,1.86733e-19,0,4.12337e-06,=,,,,not computed
+gpu0,cold,TP,100,3732,102.430380,2.75361e+06,,,20,100,,0.998831,8.57194e-21,3.9774e-21,0.000266307,0.000109409,0.000765025,1.06002e-20,0,2.83324e-05,=,,,,not computed
+gpu0,cold,TP,100,3734,105.707580,2.71447e+06,,,20,100,,0.93729,5.53294e-20,3.41791e-21,0.0293285,0.0329301,0.000396555,5.98045e-19,0,5.48953e-05,=,,,,not computed
+gpu0,cold,TP,100,3757,109.446544,1.41028e+06,,,2,1,,0.954834,0.0157635,0,0.0272198,1.88046e-08,6.38167e-06,0.00185903,1.19357e-05,0.000305348,20,100,,0.956612|8.0796e-19|1.08219e-19|0.025408|0.0157929|6.39356e-06|7.73004e-19|1.1958e-05|0.00216841,ref 101 T=109.446544; dev not computed (not converged)
+gpu0,cold,TP,100,3771,101.223879,167374,,,20,100,,0.977965,6.83131e-20,1.28109e-20,0.0205777,7.28651e-05,0,5.56718e-19,0.000792824,0.000591415,20,100,,0.977965|6.83131e-20|1.28109e-20|0.0205777|7.28651e-05|0|5.56718e-19|0.000792824|0.000591415,not computed
+gpu0,cold,TP,100,3788,104.548238,378594,,,20,100,,0.939784,2.10582e-19,2.49798e-20,0.0458186,0.0140348,3.00749e-08,1.64773e-18,0.000314535,4.77706e-05,=,,,,not computed
+gpu0,cold,TP,100,3864,100.484891,75280.1,,,20,100,,0.966882,9.67479e-20,1.97113e-20,0.0329026,0.000202098,0,1.12985e-18,0,1.35504e-05,=,,,,not computed
+gpu0,cold,TP,100,3874,101.550798,994319,,,20,100,,0.991412,1.40364e-20,1.73821e-21,0.00855116,3.68474e-05,0,3.69791e-19,0,1.44945e-07,=,,,,not computed
+gpu0,cold,TP,100,3895,100.722573,3.43731e+06,,,20,100,,0.975185,2.4445e-21,4.87545e-33,0.0213849,0.000192061,1.20638e-07,0,0,0.0032375,20,100,,0.975185|2.4445e-21|4.87545e-33|0.0213849|0.000192061|1.20638e-07|0|0|0.0032375,not computed
+gpu0,cold,TP,100,3896,104.320373,222719,,,20,100,,0.996138,3.18897e-19,1.68198e-19,0.00381172,4.7573e-05,2.23852e-06,2.24493e-20,0,5.62297e-08,=,,,,not computed
+gpu0,cold,TP,100,3912,101.104461,2.87909e+06,,,20,100,,0.990601,3.66514e-21,1.19737e-21,0.000380965,0.00836154,0,9.289e-21,0.00065324,3.23857e-06,=,,,,not computed
+gpu0,cold,TP,100,3935,106.956748,2.42011e+06,,,20,100,,0.974403,1.24892e-19,2.58398e-20,0.00381401,0.0212924,0,6.93938e-20,1.39253e-07,0.000490781,=,,,,not computed
+gpu0,cold,TP,100,3939,104.201445,7.03095e+06,,,2,1,,0.965529,0.023906,0,0.0105294,0,0,2.17018e-08,3.51498e-05,1.58928e-08,20,100,,0.96553|9.21135e-21|5.07664e-22|0.0105293|0.023906|0|4.2146e-19|3.51498e-05|3.75946e-08,ref 101 T=104.201445; dev not computed (not converged)
+gpu0,cold,TP,100,3969,107.305622,2.40078e+06,,,20,100,,0.9558,1.53096e-19,1.20239e-20,0.0287734,0.0142263,6.46996e-05,4.84638e-19,5.26072e-07,0.00113517,=,,,,not computed
+gpu0,cold,TP,100,3972,102.790148,359009,,,20,100,,0.992253,8.13977e-20,2.022e-20,0.00770865,3.87106e-05,0,2.24881e-19,1.12625e-08,4.71505e-08,=,,,,not computed
+gpu0,cold,TP,100,3977,100.758392,153450,,,20,100,,0.983389,5.61649e-20,1.1643e-20,0.016582,2.18873e-05,2.9229e-06,6.63815e-19,0,3.84682e-06,=,,,,not computed
+gpu0,cold,TP,100,3990,102.749588,2.38218e+06,,,20,100,,0.966363,1.17119e-20,1.4905e-32,0.0114373,0.0142057,9.92438e-08,0,0.00177794,0.00621576,=,,,,not computed
+gpu0,cold,TP,100,4033,101.918942,34716.6,,,2,1,,0.953284,0.036302,0,0.0104119,0,1.55553e-08,1.58562e-06,0,5.46252e-08,20,100,,0.953286|4.8345e-19|2.96829e-19|0.0104103|0.0363021|1.55553e-08|1.27809e-19|0|1.64024e-06,ref 101 T=101.918942; dev not computed (not converged)
+gpu0,cold,TP,100,4034,106.887797,8.28211e+06,,,20,100,,0.982543,3.56025e-20,2.70568e-21,0.00825264,0.00594936,0,3.38073e-19,0,0.00325517,20,100,,0.982543|3.56025e-20|2.70568e-21|0.00825264|0.00594936|0|3.38073e-19|0|0.00325517,not computed
+gpu0,cold,TP,100,4063,100.649072,95851.4,,,20,100,,0.988781,8.32779e-20,6.79843e-20,0.00165443,0.00950515,0,9.97894e-21,0,5.95471e-05,=,,,,not computed
+gpu0,cold,TP,100,4078,102.590702,8.58435e+06,,,20,100,,0.989196,3.00103e-21,2.62533e-22,0.00246947,0.00106705,0,8.08162e-20,0.00688033,0.000387016,=,,,,not computed
+gpu0,cold,TP,100,4095,100.598508,2.29742e+06,,,20,100,,0.971783,3.37633e-21,1.0363e-32,0.0210693,0.000131371,2.12617e-08,0,1.55873e-05,0.00700042,=,,,,not computed
+gpu0,cold,TP,100,4114,100.432145,18882.3,,,20,100,,0.977118,3.72812e-19,1.87779e-19,0.0211779,0.00170386,0,6.9351e-19,1.92734e-08,6.0362e-07,=,,,,not computed
+gpu0,cold,TP,100,4130,107.938364,440383,,,20,100,,0.983461,1.1897e-18,3.17384e-19,0.0156172,0.000919369,0,3.23936e-19,0,2.77326e-06,=,,,,not computed
+gpu0,cold,TP,100,4153,106.252671,6.28738e+06,,,20,100,,0.99221,3.34232e-20,2.83351e-21,0.00776525,2.42053e-05,0,2.71479e-19,3.1564e-08,8.00181e-07,=,,,,not computed
+gpu0,cold,TP,100,4173,106.927006,9.28891e+06,,,20,100,,0.966147,3.27091e-20,1.17952e-21,0.0332211,2.62914e-05,0,1.14758e-18,0,0.000605314,=,,,,not computed
+gpu0,cold,TP,100,4234,100.498978,3.60304e+06,,,20,100,,0.997526,2.03571e-21,1.26477e-32,0.000628181,1.02119e-05,7.86108e-05,0,0,0.00175683,=,,,,not computed
+gpu0,cold,TP,100,4253,100.536732,239499,,,20,100,,0.9885,3.13503e-20,6.5973e-21,0.0097932,8.5707e-05,0.00160597,3.53415e-19,3.02416e-06,1.16635e-05,=,,,,not computed
+gpu0,cold,TP,100,4260,104.114108,7.20614e+06,,,20,100,,0.980246,8.68504e-21,4.53192e-22,0.0114328,0.00732279,0.000998752,2.61455e-19,0,5.23264e-08,=,,,,not computed
+gpu0,cold,TP,100,4272,103.501141,9.96071e+06,,,20,100,,0.962649,4.42957e-21,1.08042e-22,0.033413,2.59281e-05,4.30003e-05,1.16712e-18,0.00386934,1.60496e-08,=,,,,not computed
+gpu0,cold,TP,100,4300,107.273272,7.02403e+06,,,2,1,,0.956234,0.0426543,0,0.00101993,0,0,7.35167e-05,1.8232e-05,1.72166e-08,20,100,,0.956304|4.99935e-20|1.24401e-20|0.000946481|0.0426574|0|8.8298e-21|1.82333e-05|7.35393e-05,ref 101 T=107.273272; dev not computed (not converged)
+gpu0,cold,TP,100,4313,107.013700,283530,,,20,100,,0.954463,1.08423e-18,4.01656e-19,0.0101269,0.0351419,0,2.22146e-19,0,0.000268324,=,,,,not computed
+gpu0,cold,TP,100,4326,106.390960,184482,,,20,100,,0.965476,1.22021e-18,3.26033e-19,0.0271931,0.000271421,0,3.31635e-19,0.00704561,1.37481e-05,=,,,,not computed
+gpu0,cold,TP,100,4340,106.075160,533452,,,20,100,,0.966194,3.54576e-19,5.46292e-20,0.026544,0.00725288,0,6.784e-19,8.11305e-06,1.05698e-06,=,,,,not computed
+gpu0,cold,TP,100,4347,104.410459,2.535e+06,,,20,100,,0.981933,2.94623e-20,2.21136e-21,0.0168306,0.000167829,0.00100851,4.40306e-19,0,6.00184e-05,=,,,,not computed
+gpu0,cold,TP,100,4362,101.646731,590403,,,20,100,,0.95916,2.50417e-20,1.86652e-21,0.0405921,0.000125531,0,1.367e-18,4.80152e-05,7.39442e-05,=,,,,not computed
+gpu0,cold,TP,100,4363,102.134153,3.78928e+06,,,20,100,,0.954028,5.22128e-21,7.42761e-34,0.0448183,0.000170615,2.80038e-08,0,0,0.000983371,=,,,,not computed
+gpu0,cold,TP,100,4406,101.772851,2.93254e+06,,,20,100,,0.959027,5.25054e-21,4.52254e-22,0.00607352,0.0261307,1.50949e-08,2.00566e-19,0,0.00876916,20,100,,0.959027|5.25054e-21|4.52254e-22|0.00607352|0.0261307|1.50949e-08|2.00566e-19|0|0.00876916,not computed
+gpu0,cold,TP,100,4443,101.732422,8.66299e+06,,,20,100,,0.995453,1.7956e-21,1.19578e-22,0.00352875,5.16989e-05,5.31522e-08,6.57583e-20,0,0.000966898,=,,,,not computed
+gpu0,cold,TP,100,4455,100.384034,188582,,,20,100,,0.984962,3.61267e-20,8.19224e-21,0.0103176,0.00257724,0.00027144,3.62514e-19,0.00177573,9.60362e-05,=,,,,not computed
+gpu0,cold,TP,100,4460,100.615012,24318.5,,,20,100,,0.994127,3.24069e-19,3.21778e-19,0.00441009,0.00142309,6.52975e-06,4.80353e-20,1.15144e-06,3.21203e-05,=,,,,not computed
+gpu0,cold,TP,100,4491,108.959426,9.01007e+06,,,20,100,,0.955899,9.96622e-20,3.95847e-21,0.0418823,0.00127064,0.000824856,1.26484e-18,9.54235e-05,2.79671e-05,=,,,,not computed
+gpu0,cold,TP,100,4496,101.218615,1.95167e+06,,,20,100,,0.948696,5.67793e-21,2.96022e-22,0.0221744,0.0291295,5.34641e-08,5.52721e-19,0,1.48437e-08,=,,,,not computed
+gpu0,cold,TP,100,4510,100.463693,1.31077e+06,,,20,100,,0.990066,5.46124e-21,6.47996e-22,0.00552167,0.00441203,0,1.5243e-19,0,4.47901e-07,=,,,,not computed
+gpu0,cold,TP,100,4525,107.097148,2.41178e+06,,,20,100,,0.995942,1.38184e-19,3.07912e-20,0.0034661,0.000592232,0,9.61075e-20,0,4.37086e-08,=,,,,not computed
+gpu0,cold,TP,100,4526,100.969989,1.22252e+06,,,20,100,,0.998377,8.01252e-21,6.71531e-21,0.000133307,0.00144853,2.11201e-05,1.29613e-21,0,1.96061e-05,=,,,,not computed
+gpu0,cold,TP,100,4527,103.852704,6.12342e+06,,,20,100,,0.999535,8.86642e-21,2.57147e-21,0.000415689,2.06892e-05,2.83084e-05,6.1502e-21,0,4.27299e-08,=,,,,not computed
+gpu0,cold,TP,100,4529,101.160505,503097,,,20,100,,0.984998,2.16857e-20,4.60417e-21,0.0052226,0.00031704,0.0094423,1.80241e-19,0,2.01125e-05,=,,,,not computed
+gpu0,cold,TP,100,4575,101.489273,537798,,,20,100,,0.950772,2.42093e-20,2.79492e-21,0.0173746,0.018248,1.31602e-06,6.55782e-19,1.10802e-08,0.0136042,=,,,,not computed
+gpu0,cold,TP,100,4586,109.585259,1.10203e+06,,,20,100,,0.987847,1.12946e-18,2.73021e-19,0.010418,0.00173479,0,1.47487e-19,0,4.2579e-07,=,,,,not computed
+gpu0,cold,TP,100,4599,109.415260,4.00535e+06,,,20,100,,0.954632,2.84984e-19,1.70769e-20,0.0452409,1.50478e-05,0,1.74931e-18,3.69694e-05,7.50247e-05,=,,,,not computed
+gpu0,cold,TP,100,4608,101.778543,628966,,,20,100,,0.978925,2.49385e-20,1.23426e-20,0.000871859,0.0200739,0.000128709,1.35001e-20,0,5.77439e-08,=,,,,not computed
+gpu0,cold,TP,100,4636,109.276590,310245,,,20,100,,0.964453,3.40473e-18,8.85451e-19,0.0300405,0.00475847,0,1.00819e-18,0.000746987,1.11165e-06,=,,,,not computed
+gpu0,cold,TP,100,4656,101.074785,7.80697e+06,,,20,100,,0.99505,1.33429e-21,1.59594e-22,0.00104658,0.00106312,0,3.93739e-20,0,0.00284071,=,,,,not computed
+gpu0,cold,TP,100,4660,106.886637,379625,,,20,100,,0.964241,7.82249e-19,1.36847e-19,0.0342329,0.00123996,0.000285741,1.12673e-18,0,9.14847e-07,=,,,,not computed
+gpu0,cold,TP,100,4689,101.326857,381089,,,20,100,,0.968039,3.18831e-20,3.38551e-21,0.0287904,0.000576381,2.22615e-05,7.96539e-19,0,0.00257181,=,,,,not computed
+gpu0,cold,TP,100,4695,100.145304,467713,,,20,100,,0.982747,1.24099e-20,1.05452e-20,0.000277236,0.0154552,0.00145768,7.52597e-21,0,6.25243e-05,=,,,,not computed
+gpu0,cold,TP,100,4698,104.061201,177204,,,20,100,,0.985807,3.42362e-19,1.68752e-19,0.00514922,0.00904285,9.85234e-08,6.00959e-20,0,8.30455e-07,=,,,,not computed
+gpu0,cold,TP,100,4706,100.558439,741968,,,20,100,,0.993241,1.027e-20,1.51861e-21,0.00644264,0.000146577,0,2.02266e-19,0.000169468,3.04009e-07,=,,,,not computed
+gpu0,cold,TP,100,4769,100.017448,608819,,,20,100,,0.95111,8.82457e-21,1.52134e-33,0.0340537,0.0109015,0,0,0,0.00393449,=,,,,not computed
+gpu0,cold,TP,100,4774,104.381016,3.06392e+06,,,20,100,,0.973793,2.34439e-20,3.70378e-21,0.0030553,0.0230361,0,1.04249e-19,0.000115108,8.11894e-08,=,,,,not computed
+gpu0,cold,TP,100,4787,102.710911,1.28436e+06,,,20,100,,0.98262,2.13436e-20,1.46083e-20,0.000274276,0.017073,0,3.63832e-21,0,3.24867e-05,20,100,,0.98262|2.13436e-20|1.46083e-20|0.000274276|0.017073|0|3.63832e-21|0|3.24867e-05,not computed
+gpu0,cold,TP,100,4790,103.944138,6.83446e+06,,,20,100,,0.985896,8.26918e-21,1.18205e-21,0.00154336,0.0122349,0,3.14751e-20,0,0.000325999,=,,,,not computed
+gpu0,cold,TP,100,4821,103.585266,9.70783e+06,,,20,100,,0.985774,4.73676e-21,9.3601e-33,0.00284731,0.0104514,0,0,0,0.000926823,20,100,,0.985774|4.73676e-21|9.3601e-33|0.00284731|0.0104514|0|0|0|0.000926823,not computed
+gpu0,cold,TP,100,4830,100.489982,7.73166e+06,,,20,100,,0.99554,9.44698e-22,4.31462e-34,0.0039713,0.000451392,1.59152e-07,0,0,3.74288e-05,=,,,,not computed
+gpu0,cold,TP,100,4834,103.078875,45216,,,20,100,,0.965911,7.65432e-19,2.64432e-19,0.0336536,0.000281399,0.000154142,1.26715e-18,3.64611e-08,2.81279e-07,=,,,,not computed
+gpu0,cold,TP,100,4840,104.381424,786880,,,20,100,,0.957472,8.97185e-20,3.13557e-20,0.00238891,0.0401083,1.79268e-05,7.80507e-20,0,1.26715e-05,=,,,,not computed
+gpu0,cold,TP,100,4873,101.368630,1.2226e+06,,,20,100,,0.951816,1.00053e-20,6.13389e-22,0.0266723,0.0206168,0,7.07566e-19,3.58248e-07,0.00089487,=,,,,not computed
+gpu0,cold,TP,100,4880,106.829933,2.67443e+06,,,2,1,,0.929589,0.0274019,0,0.0429711,0,7.23009e-07,1.10685e-05,0,2.62363e-05,20,100,,0.929599|1.04865e-19|6.05494e-21|0.0429605|0.0274022|7.23017e-07|1.02665e-18|0|3.73053e-05,ref 101 T=106.829933; dev not computed (not converged)
+gpu0,cold,TP,100,4966,106.744638,494452,,,20,100,,0.952937,5.56509e-19,7.20233e-20,0.0467415,0.000297626,2.23408e-05,1.24861e-18,1.41843e-06,6.77693e-08,=,,,,not computed
+gpu0,cold,TP,100,5000,104.186172,1.94675e+06,,,20,100,,0.952024,3.34303e-20,3.00734e-32,0.0374229,3.10155e-06,0.00333276,0,0,0.00721715,=,,,,not computed
+gpu0,cold,UVkkt,100,15,101.174559,1.43367e+06,3.94734,-7.07373e+06,20,100,103.021974,1693.87,3.90968e-17,5.79091e-18,9.55135,0.0234635,0,9.01847e-19,0.00014815,0.847771,=,,,,not computed
+gpu0,cold,UVkkt,100,167,100.347785,6.46685e+06,16.4524,-3.21709e+07,2,1,100.347785,7748.23,0.467372,0,2.18426,0,0,0.130649,0,0.000814148,20,100,100.558501,7748.23|9.1171e-18|2.2498e-18|2.05361|0.467372|0|2.12407e-17|0|0.131463,ref 101 T=100.558501; dev not computed (not converged)
+gpu0,cold,UVkkt,100,185,101.373502,4.83939e+06,12.5417,-2.3707e+07,20,100,101.478988,5728.59,1.58398e-17,1.72876e-18,12.7705,0.188826,0.00888086,1.57263e-17,0,0.0380614,=,,,,not computed
+gpu0,cold,UVkkt,100,253,103.086954,6.29501e+06,15.9387,-3.00613e+07,2,1,103.086954,7330.78,0.777835,0,12.8892,0,0,0.000390309,0,0.000114626,20,100,103.348444,7330.78|4.71677e-17|6.21751e-18|12.8888|0.777835|0|1.23865e-17|0|0.000504935,ref 101 T=103.348444; dev not computed (not converged)
+gpu0,cold,UVkkt,100,328,101.327258,2.85643e+06,8.28151,-1.40015e+07,20,100,101.454901,3355.38,1.56145e-17,1.02773e-18,34.9358,0.174802,0,9.29692e-18,0,0.000256122,=,,,,not computed
+gpu0,cold,UVkkt,100,557,100.427555,3.85237e+06,11.276,-1.91405e+07,20,100,100.563147,4565.62,9.14279e-18,4.68212e-19,47.7306,0.277125,0.00193954,1.88509e-19,0,0.0015953,=,,,,not computed
+gpu0,cold,UVkkt,100,672,107.955211,7.80221e+06,29.4218,-3.47328e+07,20,100,110.078845,8344.82,0,8.54863e-17,340.408,0,0.588516,2.88523e-16,0.0362412,3.58672,=,,,,not computed
+gpu0,cold,UVkkt,100,702,102.079782,1.80923e+06,4.55505,-8.84969e+06,20,100,102.080139,2131.24,0,1.42066e-17,0.436529,0,0,2.56889e-18,2.15715,0.0280047,=,,,,not computed
+gpu0,cold,UVkkt,100,885,102.211197,5.06777e+06,12.9135,-2.45181e+07,20,100,103.223731,5952.19,4.39108e-17,6.97343e-18,8.65759,2.38403,0.000515839,1.48218e-17,0,0.0426112,=,,,,not computed
+gpu0,cold,UVkkt,100,903,101.430311,2.88479e+06,8.53119,-1.4129e+07,20,100,104.565780,3378.46,9.39736e-17,8.15246e-18,37.9878,1.6703,0.00264073,1.25845e-16,0.0449584,1.35365,=,,,,not computed
+gpu0,cold,UVkkt,100,949,104.537536,3.5925e+06,10.867,-1.67942e+07,20,100,104.641823,4066.39,9.80555e-17,6.46887e-18,66.6863,0.000555846,0.00743826,4.03515e-18,0.0209217,0.0835685,=,,,,not computed
+gpu0,cold,UVkkt,100,965,100.428833,1.37332e+06,5.69,-6.85898e+06,2,1,100.428833,1575.87,0.0518579,0,68.7598,0.000121673,0.000508568,0.000374932,0.870235,0.0454739,20,100,100.507582,1575.87|8.84008e-18|3.74938e-19|68.7594|0.0519796|0.000508568|2.67525e-21|0.870235|0.0458488,ref 101 T=100.507582; dev not computed (not converged)
+gpu0,cold,UVkkt,100,1240,101.201770,2.27169e+06,7.41033,-1.12354e+07,20,100,101.201808,2647.2,1.3427e-17,7.01372e-19,52.575,1.25459,0,4.95225e-18,0,0.0835094,=,,,,not computed
+gpu0,cold,UVkkt,100,1280,100.114341,862117,2.5051,-4.43061e+06,20,100,100.743676,1027.56,1.0197e-17,1.30958e-18,7.88889,0.168818,0,5.03552e-18,3.13827,0.179737,=,,,,not computed
+gpu0,cold,UVkkt,100,1386,101.955376,4.8851e+06,12.371,-2.40179e+07,20,100,102.246769,5760.65,2.49173e-17,8.81948e-18,1.42577,0.637915,0,8.32405e-18,8.26072,0.029709,20,100,102.246769,5760.65|2.49173e-17|8.81948e-18|1.42577|0.637915|0|8.32405e-18|8.26072|0.029709,not computed
+gpu0,cold,UVkkt,100,1681,101.428130,5.15525e+06,17.922,-2.65304e+07,20,100,105.153165,5965.16,1.30299e-16,6.27081e-18,138.583,8.02155,23.3633,7.08753e-18,0,0.65609,=,,,,not computed
+gpu0,cold,UVkkt,100,1705,101.413142,3.20133e+06,9.28588,-1.58252e+07,20,100,103.341922,3758.38,4.69917e-17,3.73329e-18,35.4358,0.222559,0,7.8032e-17,0.26429,2.55717,=,,,,not computed
+gpu0,cold,UVkkt,100,1723,103.909697,9.48275e+06,25.6137,-4.51488e+07,2,1,103.909697,10905.9,0.242787,0,69.8291,0,0.507072,10.3435,0,0.136079,20,100,107.392350,10905.9|4.38122e-16|3.98866e-17|59.4856|0.242787|0.507072|3.13611e-17|0|10.4796,ref 101 T=107.392350; dev not computed (not converged)
+gpu0,cold,UVkkt,100,1725,102.240566,4.1998e+06,11.1134,-2.03545e+07,20,100,102.367605,4919.94,2.6742e-17,2.53871e-18,20.3223,8.06999e-05,0,1.01283e-17,1.28559,0.121651,=,,,,not computed
+gpu0,cold,UVkkt,100,1739,101.440292,5.25391e+06,20.2277,-2.59771e+07,20,100,101.736073,6010.51,1.84487e-17,5.00638e-19,218.04,5.38633,0,8.38828e-18,0,0.0822781,=,,,,not computed
+gpu0,cold,UVkkt,100,2153,100.985501,4.22491e+06,10.9763,-2.11117e+07,20,100,102.043521,5023.92,2.21161e-17,3.6996e-18,6.11898,4.59713,0,2.24493e-18,1.54723,0.902413,=,,,,not computed
+gpu0,cold,UVkkt,100,2156,100.442443,2.71194e+06,8.17962,-1.46798e+07,20,100,102.885155,3220.86,3.61268e-17,3.38383e-18,23.2251,4.55685,0,1.21042e-16,0.00752243,9.82764,=,,,,not computed
+gpu0,cold,UVkkt,100,2214,100.649176,2.71307e+06,7.23184,-1.39924e+07,20,100,102.663678,3234.38,3.17753e-17,6.28404e-18,4.97807,2.55691,10.0476,5.28027e-17,0.000144109,0.0560104,=,,,,not computed
+gpu0,cold,UVkkt,100,2285,103.102403,8.79328e+06,22.4435,-4.37479e+07,20,100,103.163970,10256.8,4.24282e-17,2.51168e-17,0.615518,0.20112,4.66869,4.48633e-18,0.000430753,13.0781,=,,,,not computed
+gpu0,cold,UVkkt,100,2300,101.462309,7.50704e+06,22.068,-3.83469e+07,20,100,101.514285,8820.66,1.61756e-17,7.17308e-19,77.9321,0.17805,0,2.58294e-16,45.5732,0.00743177,=,,,,not computed
+gpu0,cold,UVkkt,100,2680,100.860818,2.27953e+06,9.59632,-1.14181e+07,20,100,107.414098,2599.32,4.43201e-16,2.9286e-17,113.378,0.923753,0,2.0152e-18,0,4.4113,=,,,,not computed
+gpu0,cold,UVkkt,100,2858,102.591291,1.57366e+06,4.73276,-7.57101e+06,20,100,102.665049,1818.73,0,2.74729e-18,26.0943,0,0,1.01403e-18,0.00129342,0.0328595,=,,,,not computed
+gpu0,cold,UVkkt,100,2955,103.985504,4.74287e+06,11.9183,-2.27049e+07,20,100,104.466737,5478.72,8.89025e-17,1.92369e-17,5.98735,0.0686035,6.39722,2.26749e-17,0,0.480952,=,,,,not computed
+gpu0,cold,UVkkt,100,3103,100.913436,1.19881e+06,4.91045,-5.99734e+06,2,1,100.913436,1370.78,0.157145,0,57.8581,0,0,3.74552e-05,2.3576,0.00554657,20,100,101.184570,1370.78|1.32893e-17|6.6052e-19|57.858|0.157145|0|1.43404e-18|2.3576|0.00558403,ref 101 T=101.184570; dev not computed (not converged)
+gpu0,cold,UVkkt,100,3302,101.251694,3.22871e+06,9.02942,-1.6302e+07,20,100,102.023798,3812.93,2.18611e-17,1.95078e-18,21.4148,0.272384,0,1.76729e-18,12.1908,0.641303,=,,,,not computed
+gpu0,cold,UVkkt,100,3382,100.775604,4.29682e+06,12.2965,-2.13746e+07,20,100,103.561374,5082.47,5.32748e-17,4.07178e-18,40.0283,1.6985,0,2.46621e-18,3.44835,2.0946,=,,,,not computed
+gpu0,cold,UVkkt,100,3624,107.818532,9.98609e+06,31.1169,-4.48512e+07,20,100,108.458473,10907.3,7.66661e-16,3.91749e-17,230.155,0.495493,0.0147136,3.30942e-16,8.30416,1.62562,=,,,,not computed
+gpu0,cold,UVkkt,100,3874,101.550798,994319,2.81018,-4.85772e+06,20,100,101.642387,1167.51,1.74532e-17,2.1823e-18,10.0701,0.0433925,0,5.29959e-18,0,0.000170691,=,,,,not computed
+gpu0,cold,UVkkt,100,4078,102.590702,8.58435e+06,23.6216,-4.42308e+07,2,1,102.590702,10028.9,7.88523,0,27.0594,2.93302,0,2.02278,69.756,1.90097,20,100,105.212058,10028.9|1.34612e-16|1.53298e-17|25.0367|10.8182|0|2.37757e-18|69.756|3.92375,ref 101 T=105.212058; dev not computed (not converged)
+gpu0,cold,UVkkt,100,4121,103.345291,5.8202e+06,14.3714,-2.76908e+07,20,100,103.448227,6771.49,4.99403e-17,1.79367e-17,1.77159,0.165539,0,2.55652e-17,0,0.0791673,20,100,103.448227,6771.49|4.99403e-17|1.79367e-17|1.77159|0.165539|0|2.55652e-17|0|0.0791673,not computed
+gpu0,cold,UVkkt,100,4153,106.252671,6.28738e+06,16.8033,-2.86622e+07,20,100,106.315136,7061.54,2.4606e-16,2.09857e-17,55.2652,0.172269,0,1.91691e-17,0.000224641,0.00569487,=,,,,not computed
+gpu0,cold,UVkkt,100,4185,101.145859,276554,1.21507,-1.58569e+06,20,100,101.245471,315.693,1.37819e-17,1.4465e-18,13.1439,0.0130007,0,1.41217e-17,0,1.95809,=,,,,not computed
+gpu0,cold,UVkkt,100,4201,100.355352,201650,0.519568,-1.00359e+06,2,1,100.355352,241.377,0.0401698,0,0.253285,0,2.36807e-05,0.0185826,0,0.00027409,20,100,101.046991,241.377|1.22382e-17|9.41193e-18|0.234702|0.0401698|2.36807e-05|3.59107e-18|0|0.0188567,ref 101 T=101.046991; dev not computed (not converged)
+gpu0,cold,UVkkt,100,4272,103.501141,9.96071e+06,37.6406,-4.89075e+07,20,100,103.541833,11186.3,5.26839e-17,1.29033e-18,388.269,0.301293,0.499677,5.99675e-18,44.9629,0.000186501,=,,,,not computed
+gpu0,cold,UVkkt,100,4347,104.410459,2.535e+06,7.80996,-1.20349e+07,20,100,105.131569,2870.08,1.28751e-16,1.0378e-17,49.1939,0.490546,2.94775,8.77056e-18,0,0.175427,=,,,,not computed
+gpu0,cold,UVkkt,100,4443,101.732422,8.66299e+06,23.3025,-4.32685e+07,20,100,102.232455,10203.6,2.47093e-17,1.73382e-18,36.1703,0.529923,0.000544819,5.03298e-17,0,9.91088,=,,,,not computed
+gpu0,cold,UVkkt,100,4527,103.852704,6.12342e+06,15.0804,-2.89245e+07,20,100,103.903591,7088.48,6.4721e-17,1.8867e-17,2.94797,0.146723,0.200757,1.73411e-18,0,0.000303031,=,,,,not computed
+gpu0,cold,UVkkt,100,4949,102.015644,1.37076e+06,4.63374,-7.19945e+06,20,100,102.017809,1585.49,0,1.62586e-18,30.5745,0,0,2.35402e-19,0,4.74889,=,,,,not computed
+```
+
+### 6b. max_iter 1000, status 20 at base or head
+
+Columns: `base_maxabs_d_amount_vs_mi100` and `base_abs_dT_vs_mi100` (UV) compare with the same device/commit/cell at max_iter 100, and the `head_*` columns do the same at head. `head_status` is `=` when head is bit-identical to base. All base status-20 rows have iter 1000. No brute force was computed at max_iter 1000.
+
+```csv
+device,sweep,mode,cell,base_status,base_iter,base_maxabs_d_amount_vs_mi100,base_abs_dT_vs_mi100,head_status,head_iter,head_maxabs_d_amount_vs_mi100,head_abs_dT_vs_mi100
+cpu,wide,TP,38,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,63,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,69,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,70,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,229,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,265,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,267,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,276,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,344,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,388,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,395,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,409,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,490,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,518,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,543,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,572,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,573,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,606,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,617,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,643,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,740,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,755,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,784,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,786,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,851,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,876,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,967,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,973,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,997,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1036,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1049,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1085,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1125,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1218,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1331,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1374,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1379,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1419,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1545,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1551,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1566,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1656,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1732,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1788,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1823,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1827,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1842,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1951,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,1990,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2086,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2140,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2174,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2270,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2281,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2289,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2333,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2341,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2351,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2447,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2495,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2513,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2541,20,1000,7.8e-17,,=,,,
+cpu,wide,TP,2595,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2647,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2651,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2725,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2760,20,1000,2.5e-18,,=,,,
+cpu,wide,TP,2770,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2830,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2851,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2900,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2923,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2965,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,2983,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3039,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3073,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3097,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3102,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3166,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3183,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3207,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3317,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3398,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3446,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3487,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3514,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3525,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3589,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3630,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3678,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3694,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3719,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3743,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3750,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3751,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3824,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3906,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3917,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,3920,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4023,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4038,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4046,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4109,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4117,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4145,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4197,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4212,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4287,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4319,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4339,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4358,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4367,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4441,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4462,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4510,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4563,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4592,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4653,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4762,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4835,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4868,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4886,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4966,20,1000,0.0e+00,,=,,,
+cpu,wide,TP,4995,20,1000,0.0e+00,,=,,,
+cpu,wide,UVkkt,2447,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,wide,UVkkt,2645,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,wide,UVkkt,3589,20,1000,1.4e-31,0.0e+00,=,,,
+cpu,cold,TP,18,20,1000,1.1e-33,,=,,,
+cpu,cold,TP,28,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,64,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,73,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,91,2,1,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,130,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,135,20,1000,1.7e-34,,=,,,
+cpu,cold,TP,137,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,165,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,185,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,219,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,245,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,297,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,324,20,1000,1.1e-33,,=,,,
+cpu,cold,TP,328,20,1000,8.5e-37,,=,,,
+cpu,cold,TP,420,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,459,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,488,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,491,20,1000,2.5e-32,,=,,,
+cpu,cold,TP,501,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,522,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,528,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,534,20,1000,1.9e-37,,=,,,
+cpu,cold,TP,557,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,584,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,592,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,607,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,642,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,678,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,682,20,1000,0.0e+00,,0,78,0.0e+00,
+cpu,cold,TP,701,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,739,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,787,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,795,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,848,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,853,20,1000,8.4e-33,,=,,,
+cpu,cold,TP,875,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,885,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,903,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,916,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,924,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,965,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1031,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1095,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1135,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1152,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1179,20,1000,7.2e-35,,=,,,
+cpu,cold,TP,1232,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1238,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,1274,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,1280,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1376,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1385,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1401,2,1,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,1447,20,1000,3.5e-32,,=,,,
+cpu,cold,TP,1538,20,1000,1.5e-32,,=,,,
+cpu,cold,TP,1566,20,1000,4.8e-35,,=,,,
+cpu,cold,TP,1624,20,1000,6.0e-36,,=,,,
+cpu,cold,TP,1679,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1681,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1732,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1739,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1741,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1809,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1815,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1820,20,1000,1.3e-32,,=,,,
+cpu,cold,TP,1840,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1875,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1926,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,1998,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2030,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2134,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2158,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2192,20,1000,1.7e-32,,=,,,
+cpu,cold,TP,2203,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2204,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,2214,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2266,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2269,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2283,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2300,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2321,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2366,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,2378,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2383,20,1000,8.7e-33,,=,,,
+cpu,cold,TP,2399,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2490,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2499,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2516,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2553,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2622,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2640,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2646,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2649,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,2652,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2697,20,1000,1.7e-36,,=,,,
+cpu,cold,TP,2730,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2751,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2768,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2821,2,1,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,2836,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2897,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2899,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,2918,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,2956,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,3051,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,3088,20,1000,9.0e-36,,=,,,
+cpu,cold,TP,3095,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3122,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3173,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3192,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3229,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3301,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,3318,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3382,20,1000,1.9e-37,,=,,,
+cpu,cold,TP,3392,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3412,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3423,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3560,20,1000,3.0e-32,,=,,,
+cpu,cold,TP,3564,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3566,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3582,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3598,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,3664,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,3666,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3703,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3732,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3734,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3757,2,1,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,3771,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3788,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3864,20,1000,4.8e-35,,=,,,
+cpu,cold,TP,3874,20,1000,3.0e-36,,=,,,
+cpu,cold,TP,3896,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3912,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3935,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3939,2,1,0.0e+00,,20,1000,1.9e-36,
+cpu,cold,TP,3969,20,1000,6.0e-36,,=,,,
+cpu,cold,TP,3972,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,3977,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4033,2,1,0.0e+00,,20,1000,4.3e-33,
+cpu,cold,TP,4034,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,4063,20,1000,4.1e-33,,=,,,
+cpu,cold,TP,4078,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4114,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4130,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4153,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4173,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4253,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4260,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4272,20,1000,1.9e-37,,=,,,
+cpu,cold,TP,4300,2,1,0.0e+00,,20,1000,6.0e-36,
+cpu,cold,TP,4313,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4326,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4340,20,1000,1.7e-32,,=,,,
+cpu,cold,TP,4347,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4362,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4406,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,4443,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4455,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4460,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4491,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4496,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4510,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4525,20,1000,5.4e-33,,=,,,
+cpu,cold,TP,4526,20,1000,6.0e-35,,=,,,
+cpu,cold,TP,4527,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4529,20,1000,4.3e-33,,=,,,
+cpu,cold,TP,4575,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,4586,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4599,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4608,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4636,20,1000,7.7e-34,,=,,,
+cpu,cold,TP,4656,20,1000,5.6e-37,,=,,,
+cpu,cold,TP,4660,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4689,20,1000,4.5e-36,,=,,,
+cpu,cold,TP,4695,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4698,20,1000,1.1e-32,,=,,,
+cpu,cold,TP,4706,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4774,20,1000,1.8e-35,,=,,,
+cpu,cold,TP,4787,20,1000,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,4790,20,1000,1.0e-33,,=,,,
+cpu,cold,TP,4834,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4840,20,1000,3.4e-33,,20,1000,3.4e-33,
+cpu,cold,TP,4873,20,1000,0.0e+00,,=,,,
+cpu,cold,TP,4880,2,1,0.0e+00,,20,1000,0.0e+00,
+cpu,cold,TP,4966,20,1000,3.5e-32,,=,,,
+cpu,cold,UVkkt,15,20,1000,5.5e-31,0.0e+00,=,,,
+cpu,cold,UVkkt,167,2,1,0.0e+00,0.0e+00,20,1000,0.0e+00,0.0e+00
+cpu,cold,UVkkt,185,20,1000,1.4e-30,0.0e+00,=,,,
+cpu,cold,UVkkt,253,2,1,0.0e+00,0.0e+00,20,1000,2.7e-31,0.0e+00
+cpu,cold,UVkkt,328,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,557,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,672,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,702,20,1000,6.9e-32,0.0e+00,=,,,
+cpu,cold,UVkkt,885,20,1000,4.4e-30,0.0e+00,=,,,
+cpu,cold,UVkkt,899,20,1000,1.7e-29,0.0e+00,=,,,
+cpu,cold,UVkkt,949,20,1000,3.5e-32,0.0e+00,=,,,
+cpu,cold,UVkkt,965,20,1000,3.0e-31,0.0e+00,=,,,
+cpu,cold,UVkkt,1240,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,1386,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,1576,20,1000,3.7e-30,0.0e+00,=,,,
+cpu,cold,UVkkt,1705,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,1725,20,1000,4.3e-31,0.0e+00,=,,,
+cpu,cold,UVkkt,1739,20,1000,4.3e-32,0.0e+00,=,,,
+cpu,cold,UVkkt,1741,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,1809,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,2028,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,2153,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,2214,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,2285,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,2300,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,2545,20,1000,8.7e-30,0.0e+00,20,1000,9.3e-30,0.0e+00
+cpu,cold,UVkkt,2646,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,2697,2,1,0.0e+00,0.0e+00,20,1000,0.0e+00,0.0e+00
+cpu,cold,UVkkt,2858,20,1000,3.5e-32,0.0e+00,=,,,
+cpu,cold,UVkkt,2891,20,1000,2.8e-31,0.0e+00,=,,,
+cpu,cold,UVkkt,3103,20,1000,4.4e-32,0.0e+00,20,1000,4.4e-32,0.0e+00
+cpu,cold,UVkkt,3253,20,1000,7.4e-32,0.0e+00,20,1000,7.4e-32,0.0e+00
+cpu,cold,UVkkt,3302,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,3624,20,1000,1.1e-30,0.0e+00,=,,,
+cpu,cold,UVkkt,4078,20,1000,8.3e-30,0.0e+00,=,,,
+cpu,cold,UVkkt,4146,20,1000,9.7e-31,0.0e+00,=,,,
+cpu,cold,UVkkt,4153,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,4173,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,4185,20,1000,6.1e-32,0.0e+00,=,,,
+cpu,cold,UVkkt,4253,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,4272,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,4443,20,1000,0.0e+00,0.0e+00,=,,,
+cpu,cold,UVkkt,4506,2,1,0.0e+00,0.0e+00,20,1000,1.1e-30,0.0e+00
+cpu,cold,UVkkt,4529,20,1000,3.4e-31,0.0e+00,=,,,
+cpu,cold,UVkkt,4547,2,1,0.0e+00,0.0e+00,20,1000,1.0e-30,0.0e+00
+cpu,cold,UVkkt,4706,20,1000,2.7e-34,0.0e+00,=,,,
+cpu,cold,UVkkt,4949,2,1,0.0e+00,0.0e+00,20,1000,0.0e+00,0.0e+00
+gpu0,wide,TP,38,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,63,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,69,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,70,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,229,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,265,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,267,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,276,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,344,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,388,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,395,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,409,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,490,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,518,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,543,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,572,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,573,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,606,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,617,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,643,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,740,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,755,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,784,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,786,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,851,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,876,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,967,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,973,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,997,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1036,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1049,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1064,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1085,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1125,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1218,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1331,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1374,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1379,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1419,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1545,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1551,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1566,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1656,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1732,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1788,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1823,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1827,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1842,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1951,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,1990,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2086,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2140,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2174,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2270,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2281,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2289,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2333,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2341,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2351,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2447,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2495,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2513,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2541,20,1000,7.8e-17,,=,,,
+gpu0,wide,TP,2595,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2647,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2651,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2725,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2760,20,1000,2.5e-18,,=,,,
+gpu0,wide,TP,2770,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2830,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2851,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2900,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2923,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2965,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,2983,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3039,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3073,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3097,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3102,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3166,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3183,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3207,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3317,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3398,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3446,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3487,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3514,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3525,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3589,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3630,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3678,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3694,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3719,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3743,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3750,20,1000,9.0e-36,,=,,,
+gpu0,wide,TP,3751,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3824,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3906,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3917,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,3920,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4023,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4038,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4046,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4109,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4117,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4145,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4197,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4212,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4287,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4319,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4339,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4358,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4367,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4441,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4462,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4510,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4563,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4592,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4653,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4762,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4835,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4868,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4886,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4966,20,1000,0.0e+00,,=,,,
+gpu0,wide,TP,4995,20,1000,0.0e+00,,=,,,
+gpu0,wide,UVkkt,3589,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,TP,18,20,1000,1.1e-33,,=,,,
+gpu0,cold,TP,28,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,64,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,73,20,1000,1.1e-33,,=,,,
+gpu0,cold,TP,91,2,1,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,130,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,135,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,137,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,165,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,185,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,219,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,245,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,297,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,324,20,1000,1.1e-33,,=,,,
+gpu0,cold,TP,328,20,1000,1.1e-36,,=,,,
+gpu0,cold,TP,420,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,459,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,488,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,491,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,501,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,522,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,528,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,534,20,1000,1.9e-37,,=,,,
+gpu0,cold,TP,557,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,584,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,592,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,607,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,642,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,678,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,682,20,1000,0.0e+00,,0,78,0.0e+00,
+gpu0,cold,TP,701,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,739,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,787,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,795,20,1000,3.9e-34,,=,,,
+gpu0,cold,TP,848,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,853,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,875,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,885,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,895,20,1000,0.0e+00,,0,90,0.0e+00,
+gpu0,cold,TP,903,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,916,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,924,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,965,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1031,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1095,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1135,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1152,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1179,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1232,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1238,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,1274,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,1280,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1376,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1385,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1401,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1447,20,1000,3.5e-32,,=,,,
+gpu0,cold,TP,1538,20,1000,1.5e-32,,=,,,
+gpu0,cold,TP,1566,20,1000,4.8e-35,,=,,,
+gpu0,cold,TP,1624,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1679,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1681,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1732,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1739,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1741,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1809,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1815,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1820,20,1000,1.3e-32,,=,,,
+gpu0,cold,TP,1840,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1875,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1926,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,1998,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2030,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2134,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2158,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2192,20,1000,1.7e-32,,=,,,
+gpu0,cold,TP,2203,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2204,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,2214,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2266,20,1000,5.4e-34,,=,,,
+gpu0,cold,TP,2269,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2283,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2300,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2321,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2366,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,2378,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2383,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2399,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2490,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2499,20,1000,7.5e-37,,=,,,
+gpu0,cold,TP,2516,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2553,20,1000,1.4e-37,,=,,,
+gpu0,cold,TP,2622,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2640,20,1000,6.8e-36,,=,,,
+gpu0,cold,TP,2646,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2649,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,2652,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2697,20,1000,1.7e-36,,=,,,
+gpu0,cold,TP,2730,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2751,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2768,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2821,2,1,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,2836,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2897,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2899,20,1000,1.6e-33,,20,1000,1.6e-33,
+gpu0,cold,TP,2918,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,2956,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,3051,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,3088,20,1000,9.0e-36,,=,,,
+gpu0,cold,TP,3095,20,1000,6.0e-36,,=,,,
+gpu0,cold,TP,3103,20,1000,1.6e-36,,0,89,0.0e+00,
+gpu0,cold,TP,3122,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3173,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3192,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3229,20,1000,4.2e-33,,=,,,
+gpu0,cold,TP,3301,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,3318,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,3382,20,1000,7.1e-37,,=,,,
+gpu0,cold,TP,3392,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3412,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3423,20,1000,8.7e-33,,=,,,
+gpu0,cold,TP,3560,20,1000,3.0e-32,,=,,,
+gpu0,cold,TP,3564,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3566,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3582,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3598,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,3664,20,1000,1.4e-37,,20,1000,1.4e-37,
+gpu0,cold,TP,3666,20,1000,1.1e-33,,=,,,
+gpu0,cold,TP,3703,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3732,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3734,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3757,2,1,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,3771,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,3788,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3864,20,1000,4.8e-35,,=,,,
+gpu0,cold,TP,3874,20,1000,9.0e-36,,=,,,
+gpu0,cold,TP,3896,20,1000,4.2e-33,,=,,,
+gpu0,cold,TP,3912,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3935,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3939,2,1,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,3969,20,1000,6.0e-36,,=,,,
+gpu0,cold,TP,3972,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,3977,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4033,2,1,0.0e+00,,20,1000,4.3e-33,
+gpu0,cold,TP,4034,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,4063,20,1000,4.1e-33,,=,,,
+gpu0,cold,TP,4078,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4114,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4130,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4153,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4173,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4253,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4260,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4272,20,1000,1.9e-37,,=,,,
+gpu0,cold,TP,4300,2,1,0.0e+00,,20,1000,6.0e-36,
+gpu0,cold,TP,4313,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4326,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4340,20,1000,1.7e-32,,=,,,
+gpu0,cold,TP,4347,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4362,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4406,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,4443,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4455,20,1000,2.7e-35,,=,,,
+gpu0,cold,TP,4460,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4491,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4496,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4510,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4525,20,1000,5.4e-33,,=,,,
+gpu0,cold,TP,4526,20,1000,8.1e-35,,=,,,
+gpu0,cold,TP,4527,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4529,20,1000,4.3e-33,,=,,,
+gpu0,cold,TP,4575,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4586,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4599,20,1000,6.0e-35,,=,,,
+gpu0,cold,TP,4608,20,1000,6.0e-36,,=,,,
+gpu0,cold,TP,4636,20,1000,7.7e-34,,=,,,
+gpu0,cold,TP,4656,20,1000,5.6e-37,,=,,,
+gpu0,cold,TP,4660,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4689,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4695,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4698,20,1000,1.1e-32,,=,,,
+gpu0,cold,TP,4706,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4774,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4787,20,1000,0.0e+00,,20,1000,0.0e+00,
+gpu0,cold,TP,4790,20,1000,1.0e-33,,=,,,
+gpu0,cold,TP,4834,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4840,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4873,20,1000,0.0e+00,,=,,,
+gpu0,cold,TP,4880,2,1,0.0e+00,,20,1000,1.4e-35,
+gpu0,cold,TP,4966,20,1000,0.0e+00,,=,,,
+gpu0,cold,UVkkt,15,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,167,2,1,0.0e+00,0.0e+00,20,1000,0.0e+00,0.0e+00
+gpu0,cold,UVkkt,185,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,253,2,1,0.0e+00,0.0e+00,20,1000,5.8e-31,0.0e+00
+gpu0,cold,UVkkt,328,20,1000,5.8e-31,0.0e+00,=,,,
+gpu0,cold,UVkkt,557,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,672,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,702,20,1000,6.9e-32,0.0e+00,=,,,
+gpu0,cold,UVkkt,885,20,1000,1.1e-30,0.0e+00,=,,,
+gpu0,cold,UVkkt,903,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,949,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,965,2,1,0.0e+00,0.0e+00,20,1000,0.0e+00,0.0e+00
+gpu0,cold,UVkkt,1240,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,1280,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,1386,20,1000,3.1e-32,0.0e+00,20,1000,2.8e-32,0.0e+00
+gpu0,cold,UVkkt,1681,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,1705,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,1723,2,1,0.0e+00,0.0e+00,20,1000,1.1e-31,0.0e+00
+gpu0,cold,UVkkt,1725,20,1000,4.2e-31,0.0e+00,=,,,
+gpu0,cold,UVkkt,1739,20,1000,4.1e-31,0.0e+00,=,,,
+gpu0,cold,UVkkt,2153,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,2156,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,2214,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,2285,20,1000,2.8e-31,0.0e+00,=,,,
+gpu0,cold,UVkkt,2300,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,2680,20,1000,1.3e-30,0.0e+00,=,,,
+gpu0,cold,UVkkt,2858,20,1000,3.5e-32,0.0e+00,=,,,
+gpu0,cold,UVkkt,2955,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,3103,2,1,0.0e+00,0.0e+00,20,1000,0.0e+00,0.0e+00
+gpu0,cold,UVkkt,3302,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,3382,20,1000,3.5e-31,0.0e+00,=,,,
+gpu0,cold,UVkkt,3624,20,1000,4.6e-30,0.0e+00,=,,,
+gpu0,cold,UVkkt,3874,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,4078,2,1,0.0e+00,0.0e+00,20,1000,0.0e+00,0.0e+00
+gpu0,cold,UVkkt,4121,20,1000,0.0e+00,0.0e+00,20,1000,0.0e+00,0.0e+00
+gpu0,cold,UVkkt,4153,20,1000,4.9e-32,0.0e+00,=,,,
+gpu0,cold,UVkkt,4185,20,1000,8.6e-31,0.0e+00,=,,,
+gpu0,cold,UVkkt,4201,2,1,0.0e+00,0.0e+00,20,1000,0.0e+00,0.0e+00
+gpu0,cold,UVkkt,4272,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,4347,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,4443,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,4527,20,1000,0.0e+00,0.0e+00,=,,,
+gpu0,cold,UVkkt,4949,20,1000,2.9e-32,0.0e+00,=,,,
+```
+
